@@ -1,7 +1,8 @@
 param(
     [string]$NativeRoot = (Join-Path $env:LOCALAPPDATA 'osulazer/current'),
     [string]$OutputDirectory,
-    [ValidateSet('Release', 'Debug')][string]$BuildProfile = 'Release'
+    [ValidateSet('Release', 'Debug')][string]$BuildProfile = 'Release',
+    [string]$TargetDirectory
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -12,7 +13,7 @@ if (!$OutputDirectory) {
     $OutputDirectory = Join-Path $repo ('data-kaleidoscope-package-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N'))
 }
 $output = Assert-PackageWorkspacePath $OutputDirectory $repo
-$cargoTarget = Assert-PackageWorkspacePath (Join-Path $repo 'target') $repo
+$cargoTarget = Resolve-KaleidoscopeCargoTarget -WorkspaceRoot $repo -TargetDirectory $TargetDirectory
 if ((Test-Path -LiteralPath $output) -or (Test-Path -LiteralPath ($output + '.zip'))) { throw 'Package output or ZIP already exists; choose a new output directory.' }
 if (!(Test-Path -LiteralPath ([IO.Path]::GetDirectoryName($output)) -PathType Container)) { throw 'Package parent directory must already exist.' }
 foreach ($required in @('osu.Game.dll','osu.Framework.dll','osu!.dll','hostfxr.dll')) {
@@ -41,13 +42,15 @@ try {
     if ($BuildProfile -eq 'Release') { $cargoArguments += '--release' }
     & cargo @cargoArguments
     Assert-Build 'Native launcher build'
-    $launcher = Assert-PackageWorkspacePath (Join-Path $cargoTarget ($BuildProfile.ToLowerInvariant() + '/kaleidoscope-desktop.exe')) $repo
-    $launcherHash = (Get-FileHash -LiteralPath $launcher -Algorithm SHA256).Hash.ToLowerInvariant()
+    $launcherArtifact = Copy-KaleidoscopeLauncherArtifact -WorkspaceRoot $repo -TargetDirectory $cargoTarget -BuildProfile $BuildProfile
+    $launcher = $launcherArtifact.LauncherPath
+    $launcherHash = $launcherArtifact.Sha256
     $interfaceProof = Start-Process -FilePath $launcher -ArgumentList '--verify-embedded-interface' -WindowStyle Hidden -Wait -PassThru
     if ($interfaceProof.ExitCode -ne 0) { throw 'Embedded production interface verification failed; no launcher is ready to distribute.' }
     $package = New-KaleidoscopePackage -WorkspaceRoot $repo -LauncherPath $launcher -BridgeDirectory $bridgeOutput -LicensePath (Join-Path $repo 'LICENSE') -ExpectedCompatibilityPath (Join-Path $repo 'tools/transfiguration/compatibility.json') -OutputDirectory $output -UiDirectory (Join-Path $repo 'tools/kaleidoscope/ui') -BuildProfile $BuildProfile -InterfaceEvidence @{ kind = 'embedded_interface_command'; launcher_sha256 = $launcherHash; exit_code = $interfaceProof.ExitCode }
     Write-Output "Validated local test package: $($package.Directory)"
     Write-Output "Validated local ZIP: $($package.Archive)"
+    Write-Output "Launcher build provenance: $($launcherArtifact.ProvenancePath)"
     Write-Output 'Uses the player installed client; no official client/resources are redistributed. No game was launched.'
 } finally {
     Pop-Location

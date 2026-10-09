@@ -127,6 +127,53 @@ try {
     Write-Output 'PASS complete synthetic directory and matching ZIP; all required files hashed'
     Expect-Refusal 'synthetic package is refused by production verifier' { Test-KaleidoscopePackage -Directory $valid.Directory } '*Synthetic*'
 
+    # Cache and package workspaces are siblings within this invocation's owned
+    # fixture root. The cache is external to the package workspace; no EXE runs.
+    $packageWorkspace = Join-Path $fixtureRoot 'shared-target-package-workspace'
+    $externalCache = Join-Path $fixtureRoot 'shared-target-cargo-cache'
+    [IO.Directory]::CreateDirectory($packageWorkspace) | Out-Null
+    $ownedSource = Join-Path $packageWorkspace 'source'
+    Copy-Item -LiteralPath $baseline -Destination $ownedSource -Recurse
+    $externalLauncher = Join-Path $externalCache 'release/kaleidoscope-desktop.exe'
+    Write-Fixture $externalLauncher 'synthetic known Cargo output; never executable'
+    $previousFixtureTarget = [Environment]::GetEnvironmentVariable('CARGO_TARGET_DIR', 'Process')
+    try {
+        [Environment]::SetEnvironmentVariable('CARGO_TARGET_DIR', $null, 'Process')
+        Assert-Fixture ((Resolve-KaleidoscopeCargoTarget -WorkspaceRoot $packageWorkspace) -ceq (Join-Path $packageWorkspace 'target')) 'Default Cargo target changed.'
+        $checks++
+        Write-Output 'PASS Cargo target defaults to the package workspace target'
+        [Environment]::SetEnvironmentVariable('CARGO_TARGET_DIR', $externalCache, 'Process')
+        Assert-Fixture ((Resolve-KaleidoscopeCargoTarget -WorkspaceRoot $packageWorkspace) -ceq $externalCache) 'Shared CARGO_TARGET_DIR was ignored.'
+        $checks++
+        Write-Output 'PASS explicit shared CARGO_TARGET_DIR is resolved'
+        Assert-Fixture ((Resolve-KaleidoscopeCargoTarget -WorkspaceRoot $packageWorkspace -TargetDirectory 'selected-target') -ceq (Join-Path $packageWorkspace 'selected-target')) 'Named relative Cargo target did not override the environment.'
+        $checks++
+        Write-Output 'PASS named Cargo target overrides the environment and resolves against the source workspace'
+    } finally { [Environment]::SetEnvironmentVariable('CARGO_TARGET_DIR', $previousFixtureTarget, 'Process') }
+    Expect-Refusal 'Cargo target cannot be a file' { Resolve-KaleidoscopeCargoTarget -WorkspaceRoot $packageWorkspace -TargetDirectory $externalLauncher } '*must be a directory*'
+    Expect-Refusal 'Cargo target cannot be a filesystem root' { Resolve-KaleidoscopeCargoTarget -WorkspaceRoot $packageWorkspace -TargetDirectory ([IO.Path]::GetPathRoot($packageWorkspace)) } '*below a filesystem root*'
+    $packageArguments = @{
+        WorkspaceRoot = $packageWorkspace; LauncherPath = $externalLauncher; BridgeDirectory = (Join-Path $ownedSource 'bridge')
+        LicensePath = (Join-Path $ownedSource 'LICENSE'); ExpectedCompatibilityPath = (Join-Path $ownedSource 'bridge/compatibility.json')
+        OutputDirectory = (Join-Path $packageWorkspace 'complete-package'); UiDirectory = (Join-Path $ownedSource 'ui')
+        InterfaceEvidence = @{ kind = 'synthetic_package_integrity'; launcher_sha256 = (Get-FileHash -LiteralPath $externalLauncher -Algorithm SHA256).Hash; exit_code = $null }
+    }
+    Expect-Refusal 'package assembly still refuses a direct external cache launcher' { New-KaleidoscopePackage @packageArguments } '*inside the repository*'
+    $staged = Copy-KaleidoscopeLauncherArtifact -WorkspaceRoot $packageWorkspace -TargetDirectory $externalCache -BuildProfile Release
+    $provenance = Get-Content -LiteralPath $staged.ProvenancePath -Raw | ConvertFrom-Json -AsHashtable
+    Assert-Fixture ($provenance.kind -ceq 'launcher_output_copy' -and $provenance.source_launcher -ceq $externalLauncher -and $provenance.staged_launcher -ceq $staged.LauncherPath -and $provenance.source_sha256 -ceq $staged.Sha256 -and $provenance.staged_sha256 -ceq $staged.Sha256 -and $provenance.cargo_target_directory -ceq $externalCache) 'Shared target staging lost its exact source/hash provenance.'
+    Assert-Fixture ((Get-FileHash -LiteralPath $externalLauncher -Algorithm SHA256).Hash -ieq (Get-FileHash -LiteralPath $staged.LauncherPath -Algorithm SHA256).Hash) 'Shared target staging changed the synthetic source.'
+    Assert-Fixture (@(Get-ChildItem -LiteralPath ([IO.Path]::GetDirectoryName($staged.LauncherPath)) -File).Count -eq 2) 'Shared target staging copied unexpected cache files.'
+    $checks++
+    Write-Output 'PASS only the exact known launcher output is staged inside the package workspace with matching hash provenance'
+    $packageArguments.LauncherPath = $staged.LauncherPath
+    $sharedPackage = New-KaleidoscopePackage @packageArguments
+    $null = Test-KaleidoscopePackage -Directory $sharedPackage.Directory -AllowSyntheticFixtures
+    $null = Test-KaleidoscopePackageArchive -ArchivePath $sharedPackage.Archive -Directory $sharedPackage.Directory -AllowSyntheticFixtures
+    $checks++
+    Write-Output 'PASS staged external cache fixture completes the same directory and ZIP integrity gates'
+    Expect-Refusal 'only the known launcher filename can be staged' { Copy-KaleidoscopeLauncherArtifact -WorkspaceRoot $packageWorkspace -TargetDirectory $externalCache -BuildProfile Debug }
+
     foreach ($required in @('artifact.json', 'THIRD-PARTY-NOTICES.md', 'README.md', 'licenses/Harmony.txt')) {
         $name = $required.Replace('/', '-').Replace('.', '-')
         $source = New-FixtureSource "missing-$name"

@@ -21,6 +21,61 @@ function Assert-PackageWorkspacePath([string]$Path, [string]$WorkspaceRoot) {
     return $full
 }
 
+function Assert-LauncherBuildPath([string]$Path) {
+    $full = [IO.Path]::GetFullPath($Path)
+    $cursor = $full
+    while ($cursor) {
+        if ((Test-Path -LiteralPath $cursor) -and (Get-Item -LiteralPath $cursor -Force).Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) { throw "Launcher build path contains a reparse point: $cursor" }
+        $cursor = [IO.Path]::GetDirectoryName($cursor)
+    }
+    return $full
+}
+
+function Resolve-KaleidoscopeCargoTarget {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$WorkspaceRoot,
+        [string]$TargetDirectory
+    )
+    if ([string]::IsNullOrWhiteSpace($TargetDirectory)) { $TargetDirectory = [Environment]::GetEnvironmentVariable('CARGO_TARGET_DIR', 'Process') }
+    if ([string]::IsNullOrWhiteSpace($TargetDirectory)) { $TargetDirectory = Join-Path $WorkspaceRoot 'target' }
+    $full = Assert-LauncherBuildPath ([IO.Path]::GetFullPath($TargetDirectory, [IO.Path]::GetFullPath($WorkspaceRoot)))
+    if ((Test-Path -LiteralPath $full) -and !(Test-Path -LiteralPath $full -PathType Container)) { throw 'Cargo target must be a directory.' }
+    if ($full.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar) -eq [IO.Path]::GetPathRoot($full).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)) { throw 'Cargo target must be below a filesystem root.' }
+    return $full
+}
+
+function Copy-KaleidoscopeLauncherArtifact {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$WorkspaceRoot,
+        [Parameter(Mandatory)][string]$TargetDirectory,
+        [ValidateSet('Release', 'Debug')][string]$BuildProfile = 'Release'
+    )
+    $target = Resolve-KaleidoscopeCargoTarget -WorkspaceRoot $WorkspaceRoot -TargetDirectory $TargetDirectory
+    # Only Cargo's exact known launcher output can cross this read boundary.
+    $source = Assert-LauncherBuildPath (Join-Path $target ($BuildProfile.ToLowerInvariant() + '/kaleidoscope-desktop.exe'))
+    $item = Get-Item -LiteralPath $source -Force
+    if ($item.PSIsContainer -or $item.Length -eq 0) { throw 'Missing or invalid compiled launcher output.' }
+    $sourceHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()
+    $identity = [guid]::NewGuid().ToString('N')
+    $stage = Assert-PackageWorkspacePath (Join-Path $WorkspaceRoot ('.artifacts/launcher-builds/' + $BuildProfile.ToLowerInvariant() + '-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss') + '-' + $identity)) $WorkspaceRoot
+    if (Test-Path -LiteralPath $stage) { throw 'Launcher artifact staging directory already exists.' }
+    [IO.Directory]::CreateDirectory($stage) | Out-Null
+    $launcher = Assert-PackageWorkspacePath (Join-Path $stage 'kaleidoscope-desktop.exe') $WorkspaceRoot
+    Copy-Item -LiteralPath $source -Destination $launcher
+    $stagedHash = (Get-FileHash -LiteralPath $launcher -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($sourceHash -cne $stagedHash -or $sourceHash -cne (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()) { throw 'Compiled launcher changed during artifact staging.' }
+    $provenance = [ordered]@{
+        version = 1; identity = $identity; kind = 'launcher_output_copy'; build_profile = $BuildProfile.ToLowerInvariant()
+        cargo_target_directory = $target; source_launcher = $source; staged_launcher = $launcher
+        source_sha256 = $sourceHash; staged_sha256 = $stagedHash; staged_at_utc = [DateTime]::UtcNow.ToString('o')
+    }
+    $provenancePath = Assert-PackageWorkspacePath (Join-Path $stage 'build-provenance.json') $WorkspaceRoot
+    [IO.File]::WriteAllText($provenancePath, ($provenance | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($false))
+    return [pscustomobject]@{ LauncherPath = $launcher; Sha256 = $stagedHash; ProvenancePath = $provenancePath }
+}
+
 function Read-PackageJson([string]$Text, [string]$Name) {
     $document = $null
     try {
@@ -516,4 +571,4 @@ and licenses/Nunito.txt and licenses/NotoSansTC.txt.
     return [pscustomobject]@{ Directory = $output; Archive = $archive; VerificationKind = $InterfaceEvidence.kind }
 }
 
-Export-ModuleMember -Function Assert-PackageWorkspacePath, Test-KaleidoscopePackage, Test-KaleidoscopePackageArchive, New-KaleidoscopePackage, Test-KaleidoscopeCliTestPackage, Test-KaleidoscopeCliTestPackageArchive, New-KaleidoscopeCliTestPackage
+Export-ModuleMember -Function Assert-PackageWorkspacePath, Resolve-KaleidoscopeCargoTarget, Copy-KaleidoscopeLauncherArtifact, Test-KaleidoscopePackage, Test-KaleidoscopePackageArchive, New-KaleidoscopePackage, Test-KaleidoscopeCliTestPackage, Test-KaleidoscopeCliTestPackageArchive, New-KaleidoscopeCliTestPackage
