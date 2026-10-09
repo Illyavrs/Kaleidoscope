@@ -251,11 +251,11 @@ fn launcher_command(values: &[String]) -> Result<()> {
         ["set-client", kind, path] => {
             runtime::save_client_path(client(kind)?, std::path::Path::new(path))?
         }
-        ["start", kind] => runtime::start(client(kind)?)?,
+        ["start", kind] => runtime::start_and_wait(client(kind)?)?,
         ["start", kind, path] => {
             let kind = client(kind)?;
             runtime::save_client_path(kind, std::path::Path::new(path))?;
-            runtime::start(kind)?
+            runtime::start_and_wait(kind)?
         }
         ["stop"] => runtime::stop()?,
         ["recover"] => runtime::recover()?,
@@ -265,7 +265,27 @@ fn launcher_command(values: &[String]) -> Result<()> {
         "{}",
         serde_json::to_string_pretty(&snapshot).map_err(|error| error.to_string())?
     );
+    if values.first().map(String::as_str) == Some("start") {
+        require_started(&snapshot, values.get(1).map(String::as_str))?;
+    }
     Ok(())
+}
+
+fn require_started(
+    snapshot: &kaleidoscope::launcher::runtime::Snapshot,
+    client: Option<&str>,
+) -> Result<()> {
+    use kaleidoscope::launcher::runtime::Phase;
+    let running = match client {
+        Some("stable") => snapshot.stable.running,
+        Some("lazer") => snapshot.lazer.running,
+        _ => false,
+    };
+    if snapshot.phase == Phase::Running && running {
+        Ok(())
+    } else {
+        Err(format!("啟動未完成：{}", snapshot.detail))
+    }
 }
 
 #[cfg(test)]
@@ -319,5 +339,41 @@ mod tests {
         .is_err());
         assert!(args(&["apply", "--domain"]).is_err());
         assert!(args(&["wat"]).is_err());
+    }
+
+    #[test]
+    fn cli_start_success_requires_requested_client_running_phase() {
+        use kaleidoscope::launcher::runtime::{
+            Compatibility, LazerSnapshot, Phase, Snapshot, StableSnapshot,
+        };
+        let mut snapshot = Snapshot {
+            stable: StableSnapshot {
+                path: None,
+                running: true,
+            },
+            lazer: LazerSnapshot {
+                path: None,
+                running: false,
+                compatibility: Compatibility::Supported,
+            },
+            phase: Phase::Preparing,
+            detail: "fixed diagnostic".into(),
+            plugin_present: false,
+        };
+        for phase in [
+            Phase::Preparing,
+            Phase::Idle,
+            Phase::Error,
+            Phase::CleanupFailed,
+            Phase::Cleaning,
+        ] {
+            snapshot.phase = phase;
+            assert!(require_started(&snapshot, Some("stable")).is_err());
+        }
+        snapshot.phase = Phase::Running;
+        assert!(require_started(&snapshot, Some("stable")).is_ok());
+        assert!(require_started(&snapshot, Some("lazer")).is_err());
+        snapshot.lazer.running = true;
+        assert!(require_started(&snapshot, Some("lazer")).is_ok());
     }
 }

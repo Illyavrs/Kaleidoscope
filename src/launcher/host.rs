@@ -1,12 +1,44 @@
 //! Mandatory .NET startup bridge. This hosts the installed application without
 //! changing its assemblies or runtimeconfig. Run only in a dedicated child.
 
-use crate::Result;
 use std::path::Path;
+
+/// Only fixed codes and numeric hosting statuses may leave the native host.
+/// Runtime stderr and exception messages are deliberately not diagnostics.
+#[derive(Clone, Copy, Debug)]
+pub struct Failure {
+    pub code: &'static str,
+    pub status: Option<i32>,
+}
+
+impl Failure {
+    fn new(code: &'static str) -> Self {
+        Self { code, status: None }
+    }
+    #[cfg(windows)]
+    fn with_status(code: &'static str, status: i32) -> Self {
+        Self {
+            code,
+            status: Some(status),
+        }
+    }
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Native lazer host failed: {}", self.code)?;
+        if let Some(status) = self.status {
+            write!(formatter, " (runtime_status={status})")?;
+        }
+        Ok(())
+    }
+}
+
+type Result<T> = std::result::Result<T, Failure>;
 
 #[cfg(not(windows))]
 pub fn run_managed(_application: &Path, _hostfxr: &Path, _bridge: &Path) -> Result<i32> {
-    Err("The native lazer host currently supports Windows only".into())
+    Err(Failure::new("host_platform_unsupported"))
 }
 
 #[cfg(windows)]
@@ -54,11 +86,11 @@ mod windows {
 
     fn wide_path(value: &Path) -> Result<Vec<u16>> {
         if !value.is_absolute() || !value.is_file() {
-            return Err("The runtime host requires absolute existing files".into());
+            return Err(Failure::new("host_path_invalid"));
         }
         let mut encoded: Vec<u16> = value.as_os_str().encode_wide().collect();
         if encoded.contains(&0) {
-            return Err("A runtime path contains a NUL character".into());
+            return Err(Failure::new("host_path_invalid"));
         }
         encoded.push(0);
         Ok(encoded)
@@ -73,7 +105,7 @@ mod windows {
         name: &'static [u8],
     ) -> Result<unsafe extern "system" fn() -> isize> {
         unsafe { GetProcAddress(library, name.as_ptr()) }
-            .ok_or_else(|| "The installed .NET host is missing a required hosting API".into())
+            .ok_or_else(|| Failure::new("host_api_missing"))
     }
 
     pub(super) fn run(application: &Path, hostfxr: &Path, bridge: &Path) -> Result<i32> {
@@ -88,7 +120,7 @@ mod windows {
             )
         };
         if loaded.is_null() {
-            return Err("Cannot load the selected client's .NET host".into());
+            return Err(Failure::new("host_library_load_failed"));
         }
         let library = Library(loaded);
         // The documented hostfxr ABI uses __cdecl and UTF-16 on Windows.
@@ -114,8 +146,9 @@ mod windows {
                     close(handle);
                 }
             }
-            return Err(format!(
-                "Client runtime initialization failed ({result:#x})"
+            return Err(Failure::with_status(
+                "host_runtime_initialize_failed",
+                result,
             ));
         }
         let context = Context { handle, close };
@@ -128,8 +161,9 @@ mod windows {
         ] {
             let status = unsafe { set_property(context.handle, key, value) };
             if status != 0 {
-                return Err(format!(
-                    "Mandatory startup bridge configuration failed ({status:#x})"
+                return Err(Failure::with_status(
+                    "host_startup_hook_configuration_failed",
+                    status,
                 ));
             }
         }

@@ -29,6 +29,8 @@ const SESSION_FILENAME: &str = "managed-session.json";
 const MAX_RECORD_BYTES: u64 = 16 * 1024;
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
+const CLI_START_TIMEOUT: Duration = Duration::from_secs(40);
+const MAX_FAILURE_BYTES: u64 = 2048;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -160,6 +162,23 @@ struct Session {
     phase: Phase,
     detail: String,
     stop_requested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure: Option<Failure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host_status: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    child_exit: Option<i32>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Failure {
+    protocol: u8,
+    session: String,
+    stage: String,
+    code: String,
+    exception: String,
+    fixture: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -213,6 +232,9 @@ impl Paths {
     }
     fn ready(&self, nonce: &str) -> PathBuf {
         self.control.join(format!("session-ready-{nonce}.json"))
+    }
+    fn failure(&self, nonce: &str) -> PathBuf {
+        self.control.join(format!("session-failure-{nonce}.json"))
     }
     fn bridge(&self) -> Result<PathBuf> {
         bridge_at_launcher(&self.launcher)
@@ -269,36 +291,72 @@ pub fn save_client_path(client: Client, executable: impl AsRef<Path>) -> Result<
 /// No unrelated process or official-profile data is modified.
 pub fn start(client: Client) -> Result<Snapshot> {
     let paths = Paths::production()?;
-    let preferences = read_preferences(&paths)?;
+    start_session(&paths, client)?;
+    snapshot_at(&paths)
+}
+
+/// The CLI stays attached until the exact new session reaches a verified
+/// outcome. The GUI continues using the asynchronous `start` API.
+pub fn start_and_wait(client: Client) -> Result<Snapshot> {
+    let paths = Paths::production()?;
+    let nonce = start_session(&paths, client)?;
+    wait_for_start(|| matching_session(&paths, &nonce), CLI_START_TIMEOUT)?;
+    snapshot_at(&paths)
+}
+
+fn wait_for_start(mut read: impl FnMut() -> Result<Session>, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let session = read()?;
+        match session.phase {
+            Phase::Running => return Ok(()),
+            Phase::Error | Phase::Idle if session_completed(&session) => return Ok(()),
+            Phase::CleanupFailed if session.guardian.is_none() && session.child.is_none() => {
+                return Ok(())
+            }
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                "CLI 啟動確認逾時；尚未確認遊戲安全啟動。請執行 launcher status 查看工作階段"
+                    .into(),
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn start_session(paths: &Paths, client: Client) -> Result<String> {
+    let preferences = read_preferences(paths)?;
     let selected = preferences
         .path(client)
         .ok_or("請先選擇 osu!.exe 安裝路徑")?;
     let selected = validate_client(selected, client)?;
     if client == Client::Lazer {
-        verify_lazer_compatibility(&paths, &selected)?;
+        verify_lazer_compatibility(paths, &selected)?;
     }
-    if read_session(&paths)?
+    if read_session(paths)?
         .as_ref()
         .map(session_is_live)
         .transpose()?
         .unwrap_or(false)
     {
-        stop_at(&paths)?;
-        wait_for_session_end(&paths, CLOSE_TIMEOUT + Duration::from_secs(5))?;
+        stop_at(paths)?;
+        wait_for_session_end(paths, CLOSE_TIMEOUT + Duration::from_secs(5))?;
     }
-    recover_at(&paths)?;
+    recover_at(paths)?;
     // All shutdown identity checks happen before a ruleset is installed.
     for running in process::find_by_executable(&selected)? {
         process::close_gracefully(&running, CLOSE_TIMEOUT)?;
     }
     let library = if client == Client::Lazer {
         refuse_other_lazer_instances()?;
-        Some(resolve_library(&paths, &selected)?)
+        Some(resolve_library(paths, &selected)?)
     } else {
         None
     };
-    let _lock = ControlLock::open(&paths)?;
-    if read_session(&paths)?
+    let _lock = ControlLock::open(paths)?;
+    if read_session(paths)?
         .as_ref()
         .map(session_is_live)
         .transpose()?
@@ -323,6 +381,9 @@ pub fn start(client: Client) -> Result<Snapshot> {
         phase: Phase::Preparing,
         detail: "正在準備 Illyaverse 連線".into(),
         stop_requested: false,
+        failure: None,
+        host_status: None,
+        child_exit: None,
     };
     write_json(&paths.session(), &session)?;
     let mut command = Command::new(&paths.launcher);
@@ -336,7 +397,7 @@ pub fn start(client: Client) -> Result<Snapshot> {
         return Err(format!("無法啟動遊戲守護程序：{error}"));
     }
     drop(_lock);
-    snapshot_at(&paths)
+    Ok(nonce)
 }
 
 pub fn stop() -> Result<Snapshot> {
@@ -568,6 +629,7 @@ fn recover_at(paths: &Paths) -> Result<()> {
     }
     if let Some(mut session) = session {
         cleanup_session_ready(paths, &session)?;
+        cleanup_failure(paths, &session.nonce)?;
         session.phase = Phase::Idle;
         session.detail = "已關閉遊戲並移除 Illyaverse 連線模組".into();
         session.guardian = None;
@@ -575,6 +637,9 @@ fn recover_at(paths: &Paths) -> Result<()> {
         session.install_session = None;
         session.legacy_ready = false;
         session.stop_requested = false;
+        session.failure = None;
+        session.host_status = None;
+        session.child_exit = None;
         write_json(&paths.session(), &session)?;
     }
     Ok(())
@@ -603,7 +668,7 @@ fn run_guardian(paths: &Paths, nonce: &str) -> Result<i32> {
     };
     let mut managed: Option<ManagedRuleset> = None;
     let mut child: Option<Child> = None;
-    let result = run_client(paths, &mut session, &mut managed, &mut child);
+    let mut result = run_client(paths, &mut session, &mut managed, &mut child);
     if let Err(error) = &result {
         let _ = update_session(paths, nonce, |record| {
             record.phase = Phase::Error;
@@ -612,15 +677,14 @@ fn run_guardian(paths: &Paths, nonce: &str) -> Result<i32> {
     }
     // Never clean up on an error path while a spawned child remains alive.
     if let Some(child) = &mut child {
-        match child.try_wait() {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                child
-                    .wait()
-                    .map_err(|_| "無法確認遊戲關閉；復原紀錄已保留")?;
-            }
+        let status = match child.try_wait() {
+            Ok(Some(status)) => status,
+            Ok(None) => child
+                .wait()
+                .map_err(|_| "無法確認遊戲關閉；復原紀錄已保留")?,
             Err(_) => return Err("遊戲狀態無法確認；連線模組與復原紀錄已保留".into()),
-        }
+        };
+        capture_closed_child(paths, nonce, session.client, status.code(), &mut result)?;
     }
     update_session(paths, nonce, |record| {
         record.phase = Phase::Cleaning;
@@ -636,7 +700,8 @@ fn run_guardian(paths: &Paths, nonce: &str) -> Result<i32> {
             .and_then(|()| managed.cleanup().map(|_| ())),
         None => Ok(()),
     }
-    .and_then(|()| cleanup_ready(paths, nonce));
+    .and_then(|()| cleanup_ready(paths, nonce))
+    .and_then(|()| cleanup_failure(paths, nonce));
     let _lock = ControlLock::open(paths)?;
     let mut current = matching_session(paths, nonce)?;
     current.guardian = None;
@@ -657,7 +722,10 @@ fn run_guardian(paths: &Paths, nonce: &str) -> Result<i32> {
         }
         Err(error) => {
             current.phase = Phase::CleanupFailed;
-            current.detail = error;
+            current.detail = match &result {
+                Err(failure) => format!("{failure}；清理失敗：{error}"),
+                Ok(()) => error,
+            };
         }
     }
     write_json(&paths.session(), &current)?;
@@ -754,14 +822,17 @@ fn run_client(
             .try_wait()
             .map_err(|_| "無法查詢遊戲狀態")?;
         if let Some(status) = status {
-            return if status.success() {
-                Ok(())
-            } else {
-                Err("遊戲啟動或連線模組驗證失敗；已保留錯誤狀態".into())
-            };
+            return finish_child_exit(paths, session, ready, status.success(), status.code());
         }
         let record = matching_session(paths, &session.nonce)?;
         if session.client == Client::Lazer && !ready {
+            if let Some(failure) = read_failure(paths, &session.nonce)? {
+                let detail = failure_detail(&failure, record.host_status, None);
+                update_session(paths, &session.nonce, |record| {
+                    record.failure = Some(failure)
+                })?;
+                return Err(detail);
+            }
             if let Some(signal) = read_ready(paths, &session.nonce)? {
                 validate_ready(&signal, &session.nonce)?;
                 if record.child.as_ref().map(process::state).transpose()?
@@ -789,6 +860,118 @@ fn run_client(
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn finish_child_exit(
+    paths: &Paths,
+    session: &Session,
+    ready: bool,
+    success: bool,
+    exit_code: Option<i32>,
+) -> Result<()> {
+    // Consume the fixed safe failure before cleanup removes its sidecar. Raw
+    // game stdout/stderr never enters this record or the public snapshot.
+    let failure = if session.client == Client::Lazer {
+        read_failure(paths, &session.nonce)?
+    } else {
+        None
+    };
+    let _lock = ControlLock::open(paths)?;
+    let mut record = matching_session(paths, &session.nonce)?;
+    record.child_exit = exit_code;
+    record.failure = merge_failure(record.failure, failure)?;
+    let detail = if let Some(failure) = &record.failure {
+        Some(failure_detail(failure, record.host_status, exit_code))
+    } else if !ready || !success {
+        let code = if !ready {
+            "child_exit_before_readiness"
+        } else {
+            "child_exit_failed"
+        };
+        Some(format!(
+            "遊戲啟動失敗：stage=child code={code} child_exit={}",
+            exit_detail(exit_code)
+        ))
+    } else {
+        None
+    };
+    if let Some(detail) = &detail {
+        record.phase = Phase::Error;
+        record.detail = detail.clone();
+    }
+    write_json(&paths.session(), &record)?;
+    detail.map_or(Ok(()), Err)
+}
+
+fn merge_failure(persisted: Option<Failure>, observed: Option<Failure>) -> Result<Option<Failure>> {
+    if let (Some(persisted), Some(observed)) = (&persisted, &observed) {
+        if persisted != observed {
+            return Err("lazer 失敗紀錄互相衝突；不會接受啟動結果".into());
+        }
+    }
+    Ok(observed.or(persisted))
+}
+
+fn capture_closed_child(
+    paths: &Paths,
+    nonce: &str,
+    client: Client,
+    exit: Option<i32>,
+    result: &mut Result<()>,
+) -> Result<()> {
+    // A startup-hook failure may have been published after an earlier timeout,
+    // or the first read may have raced its create/write. Re-read only after the
+    // owned child has exited, and persist the strict safe record before cleanup.
+    let mut rejected = false;
+    let observed = if client == Client::Lazer {
+        match read_failure(paths, nonce) {
+            Ok(failure) => failure,
+            Err(error) => {
+                *result = Err(error);
+                rejected = true;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let _lock = ControlLock::open(paths)?;
+    let mut record = matching_session(paths, nonce)?;
+    match merge_failure(record.failure.clone(), observed) {
+        Ok(failure) => record.failure = failure,
+        Err(error) => {
+            *result = Err(error);
+            rejected = true;
+        }
+    }
+    record.child_exit = exit;
+    if rejected {
+        record.detail = result.as_ref().unwrap_err().clone();
+    } else if let Some(failure) = &record.failure {
+        let detail = failure_detail(failure, record.host_status, exit);
+        record.detail = detail.clone();
+        *result = Err(detail);
+    }
+    write_json(&paths.session(), &record)
+}
+
+fn exit_detail(code: Option<i32>) -> String {
+    code.map(|code| code.to_string())
+        .unwrap_or_else(|| "unavailable".into())
+}
+
+fn failure_detail(failure: &Failure, host_status: Option<i32>, exit: Option<i32>) -> String {
+    let mut detail = format!(
+        "lazer 啟動失敗：stage={} code={} exception={}",
+        failure.stage, failure.code, failure.exception
+    );
+    if let Some(status) = host_status {
+        detail.push_str(&format!(" runtime_status={status}"));
+    }
+    if let Some(exit) = exit {
+        detail.push_str(&format!(" child_exit={exit}"));
+    }
+    detail
 }
 
 fn run_lazer_host(paths: &Paths, nonce: &str) -> Result<i32> {
@@ -820,26 +1003,84 @@ fn run_lazer_host(paths: &Paths, nonce: &str) -> Result<i32> {
         write_json(&paths.session(), &session)?;
         session
     };
-    let selected = validate_client(&session.selected_executable, Client::Lazer)?;
-    verify_lazer_compatibility(paths, &selected)?;
-    let install = selected.parent().ok_or("lazer 缺少安裝資料夾")?;
-    let library = session
-        .library
-        .as_ref()
-        .ok_or("lazer 缺少原有圖譜資料夾紀錄")?;
-    library.validate()?;
-    refuse_other_lazer_instances()?;
-    validate_child_environment(paths, nonce, install, library)?;
-    let (_, hash) = verify_bridge(paths)?;
-    let bridge = library.rulesets().join(RULESET_FILENAME);
-    if artifact_sha256(&bridge)? != hash {
-        return Err("已安裝的連線模組與發行雜湊不符；不會進入 Main".into());
-    }
-    host::run_managed(
+    let preflight = (|| -> Result<(PathBuf, PathBuf)> {
+        let selected = validate_client(&session.selected_executable, Client::Lazer)?;
+        verify_lazer_compatibility(paths, &selected)?;
+        let install = selected.parent().ok_or("lazer 缺少安裝資料夾")?;
+        let library = session
+            .library
+            .as_ref()
+            .ok_or("lazer 缺少原有圖譜資料夾紀錄")?;
+        library.validate()?;
+        refuse_other_lazer_instances()?;
+        validate_child_environment(paths, nonce, install, library)?;
+        if path_exists(&paths.failure(nonce))? {
+            return Err("lazer 工作階段已有失敗訊號；不會進入 Main".into());
+        }
+        let (_, hash) = verify_bridge(paths)?;
+        let bridge = library.rulesets().join(RULESET_FILENAME);
+        if artifact_sha256(&bridge)? != hash {
+            return Err("已安裝的連線模組與發行雜湊不符；不會進入 Main".into());
+        }
+        Ok((install.to_path_buf(), bridge))
+    })();
+    let (install, bridge) = match preflight {
+        Ok(paths) => paths,
+        Err(_) => return persist_host_failure(paths, nonce, "host_preflight_failed", None),
+    };
+    match host::run_managed(
         &install.join("osu!.dll"),
         &install.join("hostfxr.dll"),
         &bridge,
-    )
+    ) {
+        Ok(code) => Ok(code),
+        Err(failure) => persist_host_failure(paths, nonce, failure.code, failure.status),
+    }
+}
+
+fn persist_host_failure(
+    paths: &Paths,
+    nonce: &str,
+    code: &str,
+    status: Option<i32>,
+) -> Result<i32> {
+    let failure = Failure {
+        protocol: 1,
+        session: nonce.to_owned(),
+        stage: "host".into(),
+        code: code.to_owned(),
+        exception: "native_host".into(),
+        fixture: false,
+    };
+    validate_failure(&failure, nonce)?;
+    // This function is reached only after run_lazer_host persisted the current
+    // validated child identity. Refuse a changed owner before publishing.
+    let _lock = ControlLock::open(paths)?;
+    let mut session = matching_session(paths, nonce)?;
+    if session.child.as_ref() != Some(&process::current_identity()?) {
+        return Err("lazer 失敗紀錄缺少受管理的主機程序身分".into());
+    }
+    let file = paths.failure(nonce);
+    check_components(&paths.control)?;
+    let mut writer = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(file)
+        .map_err(|_| "無法安全建立 lazer 主機失敗紀錄")?;
+    let bytes = serde_json::to_vec(&failure).map_err(|_| "無法編碼 lazer 主機失敗紀錄")?;
+    writer
+        .write_all(&bytes)
+        .and_then(|()| writer.sync_all())
+        .map_err(|_| "無法同步 lazer 主機失敗紀錄")?;
+    session.failure = Some(failure);
+    session.host_status = status;
+    session.detail = failure_detail(
+        session.failure.as_ref().expect("failure exists"),
+        status,
+        None,
+    );
+    write_json(&paths.session(), &session)?;
+    Err(session.detail)
 }
 
 fn validate_child_environment(
@@ -973,21 +1214,153 @@ fn read_session(paths: &Paths) -> Result<Option<Session>> {
                 return Err("工作階段程序所有權紀錄無效".into());
             }
         }
+        if let Some(failure) = &session.failure {
+            validate_failure(failure, &session.nonce)?;
+            if session.client != Client::Lazer {
+                return Err("lazer 失敗紀錄不得屬於另一種遊戲工作階段".into());
+            }
+        }
+        if session.host_status.is_some()
+            && session
+                .failure
+                .as_ref()
+                .is_none_or(|failure| failure.stage != "host")
+        {
+            return Err("原生主機狀態缺少一致的失敗紀錄".into());
+        }
     }
     Ok(session)
 }
 
 fn read_ready(paths: &Paths, nonce: &str) -> Result<Option<Ready>> {
+    if !valid_nonce(nonce) {
+        return Err("lazer 安全啟動訊號的工作階段無效".into());
+    }
     read_json(&paths.ready(nonce))
 }
 fn validate_ready(signal: &Ready, nonce: &str) -> Result<()> {
-    if signal.protocol != 1
+    if !valid_nonce(nonce)
+        || signal.protocol != 1
         || signal.session != nonce
         || signal.status != "ready"
         || signal.endpoint != SERVER
         || signal.fixture
     {
         return Err("lazer 安全啟動訊號不符合正式私服契約".into());
+    }
+    Ok(())
+}
+
+fn read_failure(paths: &Paths, nonce: &str) -> Result<Option<Failure>> {
+    if !valid_nonce(nonce) {
+        return Err("lazer 失敗紀錄的工作階段無效".into());
+    }
+    let failure = read_json_limit(&paths.failure(nonce), MAX_FAILURE_BYTES)
+        .map_err(|_| "lazer 失敗紀錄無效；不會接受啟動結果，現有檔案已保留")?;
+    if let Some(failure) = &failure {
+        validate_failure(failure, nonce)?;
+    }
+    Ok(failure)
+}
+
+fn validate_failure(failure: &Failure, nonce: &str) -> Result<()> {
+    let code_allowed = match failure.stage.as_str() {
+        "bootstrap" => matches!(
+            failure.code.as_str(),
+            "bootstrap_failed"
+                | "session_missing"
+                | "install_root_missing"
+                | "data_root_missing"
+                | "control_root_missing"
+                | "ready_file_missing"
+                | "session_invalid"
+                | "path_not_absolute"
+                | "path_not_local"
+                | "directory_missing"
+                | "fixture_data_path_invalid"
+                | "fixture_control_path_invalid"
+                | "control_path_invalid"
+                | "control_data_overlap"
+                | "data_reparse_point"
+                | "ready_path_invalid"
+                | "ready_file_exists"
+        ),
+        "assemblies" => matches!(
+            failure.code.as_str(),
+            "assembly_load_failed"
+                | "client_assembly_missing"
+                | "client_assembly_location_mismatch"
+        ),
+        "contracts" => matches!(
+            failure.code.as_str(),
+            "contract_validation_failed"
+                | "client_version_unverified"
+                | "client_assembly_unverified"
+                | "runtime_version_unverified"
+                | "ruleset_api_incompatible"
+                | "endpoint_contract_incompatible"
+                | "endpoint_factory_incompatible"
+        ),
+        "network_guards" => failure.code == "network_guard_install_failed",
+        "client_guards" => failure.code == "client_guard_install_failed",
+        "relax_guards" => failure.code == "relax_guard_install_failed",
+        "ready" => matches!(
+            failure.code.as_str(),
+            "ready_publish_failed" | "patch_not_installed"
+        ),
+        "host" => matches!(
+            failure.code.as_str(),
+            "host_preflight_failed"
+                | "host_path_invalid"
+                | "host_library_load_failed"
+                | "host_api_missing"
+                | "host_runtime_initialize_failed"
+                | "host_startup_hook_configuration_failed"
+                | "host_platform_unsupported"
+        ),
+        _ => false,
+    };
+    let exception_allowed = if failure.stage == "host" {
+        failure.exception == "native_host"
+    } else {
+        matches!(
+            failure.exception.as_str(),
+            "TransfigurationStartupException"
+                | "InvalidOperationException"
+                | "MissingMethodException"
+                | "MissingFieldException"
+                | "TypeLoadException"
+                | "FileNotFoundException"
+                | "FileLoadException"
+                | "BadImageFormatException"
+                | "IOException"
+                | "UnauthorizedAccessException"
+                | "NotSupportedException"
+                | "ArgumentException"
+                | "HarmonyException"
+                | "Exception"
+        )
+    };
+    if !valid_nonce(nonce)
+        || failure.protocol != 1
+        || failure.session != nonce
+        || failure.fixture
+        || !code_allowed
+        || !exception_allowed
+    {
+        return Err("lazer 失敗紀錄不符合正式工作階段契約；現有檔案已保留".into());
+    }
+    Ok(())
+}
+
+fn cleanup_failure(paths: &Paths, nonce: &str) -> Result<()> {
+    if let Some(failure) = read_failure(paths, nonce)? {
+        if let Some(session) = read_session(paths)? {
+            merge_failure(session.failure, Some(failure))?;
+        }
+        let path = paths.failure(nonce);
+        ordinary_file(&path)?;
+        fs::remove_file(path).map_err(|_| "無法移除工作階段失敗訊號")?;
     }
     Ok(())
 }
@@ -1199,6 +1572,10 @@ fn lock_file(path: &Path) -> Result<File> {
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    read_json_limit(path, MAX_RECORD_BYTES)
+}
+
+fn read_json_limit<T: DeserializeOwned>(path: &Path, max_bytes: u64) -> Result<Option<T>> {
     if !path_exists(path)? {
         return Ok(None);
     }
@@ -1206,10 +1583,10 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     let mut bytes = Vec::new();
     File::open(path)
         .map_err(|_| "無法開啟啟動器紀錄")?
-        .take(MAX_RECORD_BYTES + 1)
+        .take(max_bytes + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| "無法讀取啟動器紀錄")?;
-    if bytes.len() as u64 > MAX_RECORD_BYTES {
+    if bytes.len() as u64 > max_bytes {
         return Err("啟動器紀錄超過大小限制；現有檔案已保留".into());
     }
     serde_json::from_slice(&bytes)
@@ -1440,6 +1817,9 @@ mod tests {
                 phase: Phase::Preparing,
                 detail: "fixture preparing".into(),
                 stop_requested: false,
+                failure: None,
+                host_status: None,
+                child_exit: None,
             }
         }
     }
@@ -1488,6 +1868,330 @@ mod tests {
                 .is_err()
         );
         assert!(handle_internal(&["help".into()]).is_none());
+    }
+
+    #[test]
+    fn cli_wait_observes_terminal_outcomes_and_has_a_bounded_timeout() {
+        let fixture = Fixture::new();
+        for terminal in [
+            Phase::Running,
+            Phase::Error,
+            Phase::CleanupFailed,
+            Phase::Idle,
+        ] {
+            let mut session = fixture.session(&fixture.paths);
+            let mut reads = 0;
+            wait_for_start(
+                || {
+                    reads += 1;
+                    if reads > 1 {
+                        session.phase = terminal;
+                    }
+                    Ok(session.clone())
+                },
+                Duration::from_secs(1),
+            )
+            .unwrap();
+            assert_eq!(reads, 2);
+        }
+        let session = fixture.session(&fixture.paths);
+        write_json(&fixture.paths.session(), &session).unwrap();
+        let before = fs::read(fixture.paths.session()).unwrap();
+        let error = wait_for_start(
+            || matching_session(&fixture.paths, &session.nonce),
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert!(error.contains("逾時"));
+        assert_eq!(fs::read(fixture.paths.session()).unwrap(), before);
+    }
+
+    #[test]
+    fn cli_waits_through_transient_error_until_cleanup_is_finalized() {
+        let fixture = Fixture::new();
+        let mut session = fixture.session(&fixture.paths);
+        session.install_session = Some(Uuid::new_v4());
+        session.guardian = Some(process::Identity {
+            pid: 42,
+            creation_time: 1,
+            executable: session.launcher_executable.clone(),
+            executable_identity: session.launcher_identity.clone(),
+        });
+        session.child = session.guardian.clone();
+        let mut reads = 0;
+        wait_for_start(
+            || {
+                reads += 1;
+                session.phase = if reads == 2 {
+                    Phase::Cleaning
+                } else {
+                    Phase::Error
+                };
+                if reads == 3 {
+                    session.guardian = None;
+                    session.child = None;
+                    session.install_session = None;
+                }
+                Ok(session.clone())
+            },
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(reads, 3);
+    }
+
+    fn managed_failure(nonce: &str) -> Failure {
+        Failure {
+            protocol: 1,
+            session: nonce.into(),
+            stage: "assemblies".into(),
+            code: "client_assembly_location_mismatch".into(),
+            exception: "TransfigurationStartupException".into(),
+            fixture: false,
+        }
+    }
+
+    #[test]
+    fn failure_reader_is_strict_bounded_and_never_exposes_raw_diagnostics() {
+        let fixture = Fixture::new();
+        let nonce = fresh_nonce().unwrap();
+        let normal = serde_json::to_value(managed_failure(&nonce)).unwrap();
+        let file = fixture.paths.failure(&nonce);
+        write_json(&file, &normal).unwrap();
+        let accepted = read_failure(&fixture.paths, &nonce).unwrap().unwrap();
+        assert!(
+            failure_detail(&accepted, None, Some(2)).contains("client_assembly_location_mismatch")
+        );
+        for (field, value) in [
+            ("protocol", json!(2)),
+            ("session", json!("0".repeat(64))),
+            ("fixture", json!(true)),
+            ("stage", json!("foreign")),
+            ("code", json!("password=fixture-secret&token=fixture-token")),
+            ("exception", json!("path=/fixture/private.ini")),
+            ("stage", json!("ready")),
+            ("message", json!("private game exception")),
+            ("endpoint", json!("https://osu.ppy.sh")),
+        ] {
+            let mut wrong = normal.clone();
+            wrong[field] = value;
+            write_json(&file, &wrong).unwrap();
+            let error = read_failure(&fixture.paths, &nonce).unwrap_err();
+            assert!(!error.contains("fixture-secret"));
+            assert!(!error.contains("fixture-token"));
+            assert!(!error.contains("private.ini"));
+            assert!(!error.contains("private game exception"));
+            assert!(file.exists());
+        }
+        let duplicate = format!(
+            "{{\"protocol\":1,{}",
+            serde_json::to_string(&normal)
+                .unwrap()
+                .trim_start_matches('{')
+        );
+        fs::write(&file, duplicate).unwrap();
+        assert!(read_failure(&fixture.paths, &nonce).is_err());
+        fs::write(&file, vec![b' '; MAX_FAILURE_BYTES as usize + 1]).unwrap();
+        assert!(read_failure(&fixture.paths, &nonce).is_err());
+        assert!(read_failure(&fixture.paths, "../../outside").is_err());
+        assert!(read_ready(&fixture.paths, "../../outside").is_err());
+    }
+
+    #[test]
+    fn child_exit_zero_requires_prior_verified_readiness() {
+        let fixture = Fixture::new();
+        let session = fixture.session(&fixture.paths);
+        write_json(&fixture.paths.session(), &session).unwrap();
+        let error = finish_child_exit(&fixture.paths, &session, false, true, Some(0)).unwrap_err();
+        assert!(error.contains("child_exit_before_readiness"));
+        assert!(error.contains("child_exit=0"));
+        assert_eq!(
+            matching_session(&fixture.paths, &session.nonce)
+                .unwrap()
+                .phase,
+            Phase::Error
+        );
+        write_json(&fixture.paths.session(), &session).unwrap();
+        finish_child_exit(&fixture.paths, &session, true, true, Some(0)).unwrap();
+        assert_eq!(
+            matching_session(&fixture.paths, &session.nonce)
+                .unwrap()
+                .child_exit,
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn safe_failure_survives_exact_owned_artifact_and_sidecar_cleanup() {
+        let fixture = Fixture::new();
+        let mut session = fixture.session(&fixture.paths);
+        let library = session.library.as_ref().unwrap();
+        ensure_directory(&library.rulesets()).unwrap();
+        let foreign = library.rulesets().join("osu.Game.Rulesets.Other.dll");
+        fs::write(&foreign, b"unrelated fixture").unwrap();
+        let (bridge, hash) = fixture.bridge();
+        let mut managed = ManagedRuleset::open(library.rulesets()).unwrap();
+        let receipt = managed.install(bridge, &hash).unwrap();
+        session.install_session = Some(receipt.session_id);
+        write_json(&fixture.paths.session(), &session).unwrap();
+        write_json(
+            &fixture.paths.failure(&session.nonce),
+            &managed_failure(&session.nonce),
+        )
+        .unwrap();
+        let error = finish_child_exit(&fixture.paths, &session, false, false, Some(2)).unwrap_err();
+        assert!(error.contains("stage=assemblies code=client_assembly_location_mismatch"));
+        assert!(error.contains("child_exit=2"));
+        managed.cleanup().unwrap();
+        cleanup_failure(&fixture.paths, &session.nonce).unwrap();
+        update_session(&fixture.paths, &session.nonce, |record| {
+            record.install_session = None
+        })
+        .unwrap();
+        let persisted = matching_session(&fixture.paths, &session.nonce).unwrap();
+        assert_eq!(persisted.phase, Phase::Error);
+        assert_eq!(persisted.detail, error);
+        assert_eq!(
+            persisted.failure.unwrap().code,
+            "client_assembly_location_mismatch"
+        );
+        assert!(!receipt.installed_path.exists());
+        assert!(!fixture.paths.failure(&session.nonce).exists());
+        assert_eq!(fs::read(foreign).unwrap(), b"unrelated fixture");
+    }
+
+    #[test]
+    fn post_exit_read_preserves_failure_published_after_an_earlier_rejection() {
+        let fixture = Fixture::new();
+        let session = fixture.session(&fixture.paths);
+        write_json(&fixture.paths.session(), &session).unwrap();
+        let sidecar = fixture.paths.failure(&session.nonce);
+        fs::write(&sidecar, b"{\"protocol\":").unwrap();
+        let mut result = Err(read_failure(&fixture.paths, &session.nonce).unwrap_err());
+        write_json(&sidecar, &managed_failure(&session.nonce)).unwrap();
+        capture_closed_child(
+            &fixture.paths,
+            &session.nonce,
+            Client::Lazer,
+            Some(2),
+            &mut result,
+        )
+        .unwrap();
+        cleanup_failure(&fixture.paths, &session.nonce).unwrap();
+        let record = matching_session(&fixture.paths, &session.nonce).unwrap();
+        assert_eq!(
+            record.failure.unwrap().code,
+            "client_assembly_location_mismatch"
+        );
+        assert!(record.detail.contains("child_exit=2"));
+        assert!(result
+            .unwrap_err()
+            .contains("client_assembly_location_mismatch"));
+        assert!(!sidecar.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_host_failure_and_numeric_status_survive_an_absent_sidecar() {
+        let fixture = Fixture::new();
+        let paths = fixture.live_paths();
+        let mut session = fixture.session(&paths);
+        let own = process::current_identity().unwrap();
+        session.launcher_identity = own.executable_identity.clone();
+        session.guardian = Some(own.clone());
+        session.child = Some(own);
+        let library = session.library.as_ref().unwrap();
+        ensure_directory(&library.rulesets()).unwrap();
+        let (bridge, hash) = fixture.bridge();
+        let mut managed = ManagedRuleset::open(library.rulesets()).unwrap();
+        let receipt = managed.install(bridge, &hash).unwrap();
+        session.install_session = Some(receipt.session_id);
+        write_json(&paths.session(), &session).unwrap();
+        let error = persist_host_failure(
+            &paths,
+            &session.nonce,
+            "host_runtime_initialize_failed",
+            Some(-1234),
+        )
+        .unwrap_err();
+        assert!(error.contains("runtime_status=-1234"));
+        fs::remove_file(paths.failure(&session.nonce)).unwrap();
+        let error = finish_child_exit(&paths, &session, false, false, Some(2)).unwrap_err();
+        assert!(error.contains("code=host_runtime_initialize_failed"));
+        assert!(error.contains("runtime_status=-1234 child_exit=2"));
+        let persisted = matching_session(&paths, &session.nonce).unwrap();
+        assert_eq!(persisted.host_status, Some(-1234));
+        assert_eq!(persisted.failure.unwrap().stage, "host");
+        // This test owns only synthetic ruleset bytes; no game process exists.
+        managed.cleanup().unwrap();
+        assert!(!receipt.installed_path.exists());
+        assert!(matching_session(&paths, &session.nonce).is_ok());
+    }
+
+    #[test]
+    fn incompatible_safe_failure_records_are_rejected() {
+        let nonce = fresh_nonce().unwrap();
+        let first = managed_failure(&nonce);
+        let mut second = first.clone();
+        second.code = "assembly_load_failed".into();
+        assert!(merge_failure(Some(first.clone()), Some(second))
+            .unwrap_err()
+            .contains("衝突"));
+        assert_eq!(
+            merge_failure(Some(first.clone()), None).unwrap(),
+            Some(first)
+        );
+    }
+
+    #[test]
+    fn post_exit_rejection_preserves_conflicting_sidecar_and_prior_failure() {
+        let fixture = Fixture::new();
+        let mut session = fixture.session(&fixture.paths);
+        let first = managed_failure(&session.nonce);
+        session.failure = Some(first.clone());
+        write_json(&fixture.paths.session(), &session).unwrap();
+        let mut second = first.clone();
+        second.code = "assembly_load_failed".into();
+        let sidecar = fixture.paths.failure(&session.nonce);
+        write_json(&sidecar, &second).unwrap();
+        let before = fs::read(&sidecar).unwrap();
+        let mut result = Ok(());
+        capture_closed_child(
+            &fixture.paths,
+            &session.nonce,
+            Client::Lazer,
+            Some(2),
+            &mut result,
+        )
+        .unwrap();
+        assert!(result.unwrap_err().contains("衝突"));
+        let record = matching_session(&fixture.paths, &session.nonce).unwrap();
+        assert!(record.detail.contains("衝突"));
+        assert_eq!(record.failure, Some(first));
+        assert!(cleanup_failure(&fixture.paths, &session.nonce)
+            .unwrap_err()
+            .contains("衝突"));
+        assert_eq!(fs::read(&sidecar).unwrap(), before);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn linked_failure_sidecar_is_preserved_and_never_accepted() {
+        let fixture = Fixture::new();
+        let nonce = fresh_nonce().unwrap();
+        let target = fixture.directory.join("foreign-failure.json");
+        write_json(&target, &managed_failure(&nonce)).unwrap();
+        let before = fs::read(&target).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, fixture.paths.failure(&nonce)).unwrap();
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_file(&target, fixture.paths.failure(&nonce)).is_err() {
+            eprintln!("SKIPPED failure symlink fixture: missing Windows symlink privilege");
+            return;
+        }
+        assert!(read_failure(&fixture.paths, &nonce).is_err());
+        assert!(cleanup_failure(&fixture.paths, &nonce).is_err());
+        assert_eq!(fs::read(target).unwrap(), before);
     }
 
     #[test]
