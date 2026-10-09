@@ -5,6 +5,8 @@ $script:bridgeName = 'osu.Game.Rulesets.Transfiguration.dll'
 $script:licenseNames = @('DotNet.txt', 'Harmony.txt', 'Iced.txt', 'Mono.Cecil.txt', 'MonoMod.txt')
 $script:payloadNames = @('Kaleidoscope.exe', $script:bridgeName, 'artifact.json', 'compatibility.json', 'THIRD-PARTY-NOTICES.md', 'LICENSE', 'README.txt', 'Transfiguration-README.md') + @($script:licenseNames | ForEach-Object { "licenses/$_" })
 $script:allNames = $script:payloadNames + @('package.json')
+$script:guiPayloadNames = $script:payloadNames + @('Kaleidoscope-THIRD-PARTY-NOTICES.md', 'licenses/Nunito.txt', 'licenses/NotoSansTC.txt')
+$script:guiAllNames = $script:guiPayloadNames + @('package.json')
 
 function Assert-PackageWorkspacePath([string]$Path, [string]$WorkspaceRoot) {
     $full = [IO.Path]::GetFullPath($Path)
@@ -65,19 +67,32 @@ function Assert-PackageProtocol($Value, [string]$Name) {
     if (($Value -isnot [long] -and $Value -isnot [int]) -or $Value -ne 1) { throw "Unsupported package protocol: $Name" }
 }
 
+function Assert-PackageEndpointPolicy($Value, [string]$Name) {
+    Assert-PackageLiteral $Value.default_endpoint 'https://illya.test' "$Name default_endpoint"
+    Assert-PackageLiteral $Value.endpoint_mode 'https_origin_per_session' "$Name endpoint_mode"
+    Assert-PackageBoolean $Value.configurable_endpoint $true "$Name configurable_endpoint"
+}
+
+function Assert-PackageAuthPolicy($Value, [string]$Name) {
+    Assert-PackageLiteral $Value.private_auth_filename 'auth.illyaverse.json' "$Name private_auth_filename"
+    Assert-PackageBoolean $Value.shared_game_preferences $true "$Name shared_game_preferences"
+}
+
 function Assert-BridgePackageMetadata($Artifact, $Compatibility, [string]$BridgeHash) {
-    Assert-PackageKeys $Artifact @('protocol', 'artifact', 'sha256', 'endpoint', 'fixture') 'artifact.json'
+    Assert-PackageKeys $Artifact @('protocol', 'artifact', 'sha256', 'default_endpoint', 'endpoint_mode', 'configurable_endpoint', 'private_auth_filename', 'shared_game_preferences', 'fixture') 'artifact.json'
     Assert-PackageProtocol $Artifact.protocol 'artifact.json'
     Assert-PackageBoolean $Artifact.fixture $false 'artifact.json.fixture'
     Assert-PackageHash $Artifact.sha256 'artifact.json.sha256'
     Assert-PackageLiteral $Artifact.artifact $script:bridgeName 'artifact.json.artifact'
-    Assert-PackageLiteral $Artifact.endpoint 'https://illya.test' 'artifact.json.endpoint'
+    Assert-PackageEndpointPolicy $Artifact 'artifact.json'
+    Assert-PackageAuthPolicy $Artifact 'artifact.json'
     if ($Artifact.sha256 -ine $BridgeHash) { throw 'Production bridge artifact metadata or hash does not match.' }
-    Assert-PackageKeys $Compatibility @('protocol', 'artifact', 'endpoint', 'fixture', 'platform', 'runtime', 'ruleset_api', 'harmony', 'assemblies', 'contracts', 'verification') 'compatibility.json'
+    Assert-PackageKeys $Compatibility @('protocol', 'artifact', 'default_endpoint', 'endpoint_mode', 'configurable_endpoint', 'private_auth_filename', 'shared_game_preferences', 'fixture', 'platform', 'runtime', 'ruleset_api', 'harmony', 'assemblies', 'contracts', 'verification') 'compatibility.json'
     Assert-PackageProtocol $Compatibility.protocol 'compatibility.json'
     Assert-PackageBoolean $Compatibility.fixture $false 'compatibility.json.fixture'
     Assert-PackageLiteral $Compatibility.artifact $script:bridgeName 'compatibility.json.artifact'
-    Assert-PackageLiteral $Compatibility.endpoint 'https://illya.test' 'compatibility.json.endpoint'
+    Assert-PackageEndpointPolicy $Compatibility 'compatibility.json'
+    Assert-PackageAuthPolicy $Compatibility 'compatibility.json'
     Assert-PackageLiteral $Compatibility.platform 'windows-x64' 'compatibility.json.platform'
     foreach ($key in @('runtime', 'ruleset_api', 'harmony')) {
         if ($Compatibility[$key] -isnot [string] -or $Compatibility[$key] -cnotmatch '^\d+\.\d+\.\d+$') { throw "Invalid compatibility version: $key" }
@@ -95,14 +110,20 @@ function Assert-BridgePackageMetadata($Artifact, $Compatibility, [string]$Bridge
     foreach ($contract in $Compatibility.contracts) {
         if ($contract -isnot [string] -or [string]::IsNullOrWhiteSpace($contract) -or !$contracts.Add($contract)) { throw 'Invalid or duplicate compatibility contract.' }
     }
-    foreach ($contract in @('OsuGameBase.CreateEndpoints', 'Host.GetSuitableDesktopHost', 'DesktopGameHost.GetDefaultGameStorage', 'IniConfigManager<OsuSetting>.Filename(exact OsuConfigManager only)', 'OsuConfigManager.ctor(Storage):pre-load and post-load isolation', 'APIAccess.ctor(OsuGameBase,OsuConfigManager,EndpointConfiguration,string)', 'RulesetStore.addRuleset', 'SocketsHttpHandler.SendAsync', 'ClientWebSocket.ConnectAsync(Uri,CancellationToken)')) {
+    foreach ($obsolete in @('IniConfigManager<OsuSetting>.Filename(exact OsuConfigManager only)', 'OsuConfigManager.ctor(Storage):pre-load and post-load isolation')) {
+        if ($contracts.Contains($obsolete)) { throw 'Obsolete whole-game configuration isolation contract.' }
+    }
+    foreach ($contract in @('OsuGameBase.CreateEndpoints', 'Host.GetSuitableDesktopHost', 'DesktopGameHost.GetDefaultGameStorage', 'IniConfigManager<OsuSetting>.PerformLoad:auth-only stream overlay', 'IniConfigManager<OsuSetting>.PerformSave:shared preferences and private auth partition', 'NativeStorage.GetStream:scoped game.ini auth filtering', 'Storage.CreateFileSafely:scoped native preference serialization', 'OsuConfigManager.ctor(Storage):shared preferences and private auth before API', 'APIAccess.ctor(OsuGameBase,OsuConfigManager,EndpointConfiguration,string)', 'RulesetStore.addRuleset', 'SocketsHttpHandler.SendAsync', 'ClientWebSocket.ConnectAsync(Uri,CancellationToken)')) {
         if (!$contracts.Contains($contract)) { throw "Missing mandatory compatibility contract: $contract" }
     }
     $verification = [ordered]@{
-        native_metadata_and_endpoints = 'passed'; http_websocket_and_redirects = 'passed'; mandatory_bootstrap_before_headless_main = 'passed'; production_destination_policy = 'passed'
+        native_metadata_and_endpoints = 'passed'; http_websocket_and_redirects = 'passed'; mandatory_bootstrap_before_headless_main = 'passed'; production_destination_policy = 'passed'; configurable_https_origin = 'passed_source_linked'
         rx_native_request_context = 'passed_headless'; rx_statistics_generation_cache = 'passed_headless'
         shared_existing_library_storage = 'passed_headless_path_and_marker_fixture'
-        private_configuration_before_api_constructor = 'passed_headless_real_config_constructor'
+        auth_only_before_api_constructor = 'passed_headless_real_config_constructor'
+        shared_game_preferences = 'passed_headless_native_load_save'
+        official_auth_byte_preservation = 'passed_headless_native_load_save_logout'
+        endpoint_bound_private_auth = 'passed_source_linked_and_headless_real_config'
         private_credential_save_logout_remember_flags = 'passed_headless_native_handlers_worker_intercepted'
         real_api_worker_refresh_and_login = 'pending_human_test'; native_gui_and_login = 'pending_human_test'
     }
@@ -110,7 +131,7 @@ function Assert-BridgePackageMetadata($Artifact, $Compatibility, [string]$Bridge
     foreach ($key in $verification.Keys) { Assert-PackageLiteral $Compatibility.verification[$key] $verification[$key] "compatibility.json.verification.$key" }
 }
 
-function Get-PackageFileRecords([string]$Directory) {
+function Get-PackageFileRecords([string]$Directory, [string[]]$AllowedNames = $script:guiAllNames) {
     if (!(Test-Path -LiteralPath $Directory -PathType Container)) { throw 'Assembled package directory is missing.' }
     $root = [IO.Path]::GetFullPath($Directory)
     if ((Get-Item -LiteralPath $root -Force).Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) { throw 'Package directory is a reparse point.' }
@@ -122,7 +143,7 @@ function Get-PackageFileRecords([string]$Directory) {
             continue
         }
         $name = [IO.Path]::GetRelativePath($root, $item.FullName).Replace('\', '/')
-        if ($script:allNames -cnotcontains $name -or $item.Length -eq 0) { throw "Unexpected or empty package file: $name" }
+        if ($AllowedNames -cnotcontains $name -or $item.Length -eq 0) { throw "Unexpected or empty package file: $name" }
         $records[$name] = @{ sha256 = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant(); text = $null }
         if ($name.EndsWith('.json', [StringComparison]::Ordinal)) {
             if ($item.Length -gt 1MB) { throw 'Package JSON exceeds the integrity verifier size limit.' }
@@ -133,33 +154,35 @@ function Get-PackageFileRecords([string]$Directory) {
 }
 
 function Assert-PackageRecords($Records, [switch]$AllowSyntheticFixtures) {
-    Assert-PackageKeys $Records $script:allNames 'assembled package files'
+    Assert-PackageKeys $Records $script:guiAllNames 'assembled package files'
     $artifact = Read-PackageJson $Records['artifact.json'].text 'artifact.json'
     $compatibility = Read-PackageJson $Records['compatibility.json'].text 'compatibility.json'
     Assert-BridgePackageMetadata $artifact $compatibility $Records[$script:bridgeName].sha256
     $package = Read-PackageJson $Records['package.json'].text 'package.json'
-    Assert-PackageKeys $package @('version', 'status', 'server', 'fixture', 'bridge_sha256', 'embedded_interface_verified', 'native_gui_verified', 'verification_kind', 'completed_at_utc', 'content_sha256') 'package.json'
+    Assert-PackageKeys $package @('version', 'status', 'default_endpoint', 'endpoint_mode', 'configurable_endpoint', 'fixture', 'build_profile', 'bridge_sha256', 'embedded_interface_verified', 'native_gui_verified', 'verification_kind', 'completed_at_utc', 'content_sha256') 'package.json'
     Assert-PackageProtocol $package.version 'package.json'
     Assert-PackageBoolean $package.fixture $false 'package.json.fixture'
     Assert-PackageBoolean $package.native_gui_verified $false 'package.json.native_gui_verified'
     Assert-PackageLiteral $package.status 'complete' 'package.json.status'
-    Assert-PackageLiteral $package.server 'https://illya.test' 'package.json.server'
+    Assert-PackageEndpointPolicy $package 'package.json'
     Assert-PackageHash $package.bridge_sha256 'package.json.bridge_sha256'
     if ($package.bridge_sha256 -ine $Records[$script:bridgeName].sha256) { throw 'Package bridge hash does not match.' }
     if ($package.verification_kind -isnot [string]) { throw 'Unsupported package verification evidence.' }
     if ($package.verification_kind -ceq 'synthetic_package_integrity') {
         if (!$AllowSyntheticFixtures) { throw 'Synthetic package integrity evidence is not production interface evidence.' }
         Assert-PackageBoolean $package.embedded_interface_verified $false 'synthetic embedded_interface_verified'
+        Assert-PackageLiteral $package.build_profile 'synthetic' 'synthetic build_profile'
     } elseif ($package.verification_kind -ceq 'embedded_interface_command') {
         Assert-PackageBoolean $package.embedded_interface_verified $true 'embedded_interface_verified'
+        if ($package.build_profile -isnot [string] -or @('debug', 'release') -cnotcontains $package.build_profile) { throw 'Unsupported GUI build profile.' }
     } else { throw 'Unsupported package verification evidence.' }
     # Earlier PowerShell versions deserialize ISO timestamps as DateTime automatically.
     if ($package.completed_at_utc -is [DateTime] -and $package.completed_at_utc.Kind -eq [DateTimeKind]::Utc) { $package.completed_at_utc = $package.completed_at_utc.ToString('o') }
     if ($package.completed_at_utc -isnot [string] -or $package.completed_at_utc -cnotmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z$') { throw 'Invalid package completion timestamp.' }
     $parsedTimestamp = [DateTime]::MinValue
     if (![DateTime]::TryParse($package.completed_at_utc, [ref]$parsedTimestamp)) { throw 'Invalid package completion timestamp.' }
-    Assert-PackageKeys $package.content_sha256 $script:payloadNames 'package.json.content_sha256'
-    foreach ($name in $script:payloadNames) {
+    Assert-PackageKeys $package.content_sha256 $script:guiPayloadNames 'package.json.content_sha256'
+    foreach ($name in $script:guiPayloadNames) {
         Assert-PackageHash $package.content_sha256[$name] "package content $name"
         if ($package.content_sha256[$name] -ine $Records[$name].sha256) { throw "Package content hash does not match: $name" }
     }
@@ -172,14 +195,14 @@ function Test-KaleidoscopePackage {
     return Assert-PackageRecords (Get-PackageFileRecords $Directory) -AllowSyntheticFixtures:$AllowSyntheticFixtures
 }
 
-function Get-PackageArchiveRecords([string]$ArchivePath) {
+function Get-PackageArchiveRecords([string]$ArchivePath, [string[]]$AllowedNames = $script:guiAllNames) {
     $records = [ordered]@{}
     $zip = [IO.Compression.ZipFile]::OpenRead([IO.Path]::GetFullPath($ArchivePath))
     try {
         $names = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
         foreach ($entry in $zip.Entries) {
             $name = $entry.FullName
-            if ($script:allNames -cnotcontains $name -or !$names.Add($name) -or $entry.Length -eq 0) { throw "Unexpected, duplicate or empty ZIP entry: $name" }
+            if ($AllowedNames -cnotcontains $name -or !$names.Add($name) -or $entry.Length -eq 0) { throw "Unexpected, duplicate or empty ZIP entry: $name" }
             if ($entry.Length -gt 256MB) { throw 'Package ZIP entry exceeds the integrity verifier size limit.' }
             $stream = $entry.Open()
             try {
@@ -205,22 +228,23 @@ function Test-KaleidoscopePackageArchive {
     if ($Directory) {
         $files = Get-PackageFileRecords $Directory
         $null = Assert-PackageRecords $files -AllowSyntheticFixtures:$AllowSyntheticFixtures
-        foreach ($name in $script:allNames) { if ($records[$name].sha256 -ine $files[$name].sha256) { throw "ZIP does not match assembled package: $name" } }
+        foreach ($name in $script:guiAllNames) { if ($records[$name].sha256 -ine $files[$name].sha256) { throw "ZIP does not match assembled package: $name" } }
     }
     return $package
 }
 
 function Assert-CliPackageBindings($Bindings, $Compatibility, [string]$BridgeHash) {
-    Assert-PackageKeys $Bindings @('protocol', 'artifact_kind', 'server', 'bridge_sha256', 'bridge_verified', 'official_fallback', 'shared_existing_library', 'private_config_filename', 'supported_assemblies') 'CLI package bindings'
+    Assert-PackageKeys $Bindings @('protocol', 'artifact_kind', 'default_endpoint', 'endpoint_mode', 'configurable_endpoint', 'bridge_sha256', 'bridge_verified', 'official_fallback', 'shared_existing_library', 'private_auth_filename', 'shared_game_preferences', 'supported_assemblies') 'CLI package bindings'
     Assert-PackageProtocol $Bindings.protocol 'CLI package bindings'
     Assert-PackageLiteral $Bindings.artifact_kind 'cli_connection_test' 'CLI artifact_kind'
-    Assert-PackageLiteral $Bindings.server 'https://illya.test' 'CLI server'
+    Assert-PackageEndpointPolicy $Bindings 'CLI'
     Assert-PackageHash $Bindings.bridge_sha256 'CLI bridge_sha256'
     if ($Bindings.bridge_sha256 -cne $BridgeHash) { throw 'Compiled CLI bridge hash does not match the production bridge.' }
     Assert-PackageBoolean $Bindings.bridge_verified $true 'CLI bridge_verified'
     Assert-PackageBoolean $Bindings.official_fallback $false 'CLI official_fallback'
     Assert-PackageBoolean $Bindings.shared_existing_library $true 'CLI shared_existing_library'
-    Assert-PackageLiteral $Bindings.private_config_filename 'game.illyaverse.ini' 'CLI private configuration'
+    Assert-PackageLiteral $Bindings.private_auth_filename 'auth.illyaverse.json' 'CLI private authentication file'
+    Assert-PackageBoolean $Bindings.shared_game_preferences $true 'CLI shared game preferences'
     Assert-PackageKeys $Bindings.supported_assemblies @('osu.Game.dll', 'osu.Framework.dll', 'osu!.dll') 'CLI supported assemblies'
     foreach ($name in $Bindings.supported_assemblies.Keys) {
         Assert-PackageHash $Bindings.supported_assemblies[$name] "CLI assembly $name"
@@ -234,11 +258,11 @@ function Assert-CliPackageRecords($Records) {
     $compatibility = Read-PackageJson $Records['compatibility.json'].text 'compatibility.json'
     Assert-BridgePackageMetadata $artifact $compatibility $Records[$script:bridgeName].sha256
     $package = Read-PackageJson $Records['package.json'].text 'package.json'
-    Assert-PackageKeys $package @('version', 'artifact_kind', 'status', 'server', 'fixture', 'build_profile', 'bridge_sha256', 'native_gui_verified', 'native_login_verified', 'verification_kind', 'package_bindings', 'completed_at_utc', 'content_sha256') 'CLI package.json'
+    Assert-PackageKeys $package @('version', 'artifact_kind', 'status', 'default_endpoint', 'endpoint_mode', 'configurable_endpoint', 'fixture', 'build_profile', 'bridge_sha256', 'native_gui_verified', 'native_login_verified', 'verification_kind', 'package_bindings', 'completed_at_utc', 'content_sha256') 'CLI package.json'
     Assert-PackageProtocol $package.version 'CLI package.json'
     Assert-PackageLiteral $package.artifact_kind 'cli_connection_test' 'CLI package artifact_kind'
     Assert-PackageLiteral $package.status 'ready_for_manual_connection_test' 'CLI package status'
-    Assert-PackageLiteral $package.server 'https://illya.test' 'CLI package server'
+    Assert-PackageEndpointPolicy $package 'CLI package'
     Assert-PackageLiteral $package.build_profile 'debug' 'CLI package build_profile'
     Assert-PackageLiteral $package.verification_kind 'cli_package_bindings_command' 'CLI verification_kind'
     Assert-PackageBoolean $package.fixture $false 'CLI package fixture'
@@ -261,16 +285,16 @@ function Assert-CliPackageRecords($Records) {
 function Test-KaleidoscopeCliTestPackage {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Directory)
-    return Assert-CliPackageRecords (Get-PackageFileRecords $Directory)
+    return Assert-CliPackageRecords (Get-PackageFileRecords $Directory -AllowedNames $script:allNames)
 }
 
 function Test-KaleidoscopeCliTestPackageArchive {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$ArchivePath, [string]$Directory)
-    $records = Get-PackageArchiveRecords $ArchivePath
+    $records = Get-PackageArchiveRecords $ArchivePath -AllowedNames $script:allNames
     $package = Assert-CliPackageRecords $records
     if ($Directory) {
-        $files = Get-PackageFileRecords $Directory
+        $files = Get-PackageFileRecords $Directory -AllowedNames $script:allNames
         $null = Assert-CliPackageRecords $files
         foreach ($name in $script:allNames) { if ($records[$name].sha256 -cne $files[$name].sha256) { throw "CLI ZIP does not match assembled package: $name" } }
     }
@@ -333,12 +357,22 @@ From this directory in PowerShell, launch your installed stock lazer with:
   .\Kaleidoscope.exe launcher start lazer "$env:LOCALAPPDATA\osulazer\current\osu!.exe"
 
 For a custom installation, replace that final path with its osu!.exe path.
-Use your Illyaverse website account. This package is fixed to https://illya.test
-and needs the existing local DNS/CA setup. It never falls back to official osu!.
+Use the selected Illyaverse deployment's website account. The default endpoint
+is https://illya.test; launcher settings accept a validated HTTPS origin for the
+next launch. The illya.test setup needs the existing local DNS/CA. TLS remains
+required and this package never falls back to official osu!.
+To view or save the next-launch endpoint:
+  .\Kaleidoscope.exe launcher settings
+  .\Kaleidoscope.exe launcher set-endpoint "https://your-illyaverse.example"
+Stable requires HTTPS port 443; lazer also accepts custom HTTPS ports.
 Only lazer 2026.1005.1 with the exact compatibility.json assembly hashes is
 accepted. Unsupported updates refuse to start; do not manually install the DLL.
-The original default/custom/portable beatmap library is reused. Private login
-and game preferences use game.illyaverse.ini; official game.ini is not copied.
+The original default/custom/portable beatmap library is reused. Gameplay, UI,
+audio and input preferences remain shared through the original game.ini.
+Only account/session state and remember-login flags use auth.illyaverse.json in
+that same library, with separate profiles for each canonical endpoint. Official
+account fields are filtered before private API use and preserved when saving
+shared preferences. The old game.illyaverse.ini is not copied or migrated.
 Keep the package directory in place while the game and its guardian are running.
 Close lazer normally. The guardian then removes only its unchanged owned DLL.
 For interrupted cleanup, run: .\Kaleidoscope.exe launcher recover
@@ -358,7 +392,7 @@ See compatibility.json, Transfiguration-README.md and THIRD-PARTY-NOTICES.md.
     if ($hashes['Kaleidoscope.exe'] -cne (Get-FileHash -LiteralPath $LauncherPath -Algorithm SHA256).Hash.ToLowerInvariant() -or $hashes[$script:bridgeName] -cne $bridgeHash -or $hashes['compatibility.json'] -cne $expectedHash) { throw 'CLI source changed during assembly.' }
     $manifest = [ordered]@{
         version = 1; artifact_kind = 'cli_connection_test'; status = 'ready_for_manual_connection_test'
-        server = 'https://illya.test'; fixture = $false; build_profile = 'debug'; bridge_sha256 = $bridgeHash
+        default_endpoint = 'https://illya.test'; endpoint_mode = 'https_origin_per_session'; configurable_endpoint = $true; fixture = $false; build_profile = 'debug'; bridge_sha256 = $bridgeHash
         native_gui_verified = $false; native_login_verified = $false; verification_kind = 'cli_package_bindings_command'
         package_bindings = $bindings; completed_at_utc = [DateTime]::UtcNow.ToString('o'); content_sha256 = $hashes
     }
@@ -384,7 +418,9 @@ function New-KaleidoscopePackage {
         [Parameter(Mandatory)][string]$LicensePath,
         [Parameter(Mandatory)][string]$ExpectedCompatibilityPath,
         [Parameter(Mandatory)][string]$OutputDirectory,
-        [Parameter(Mandatory)][hashtable]$InterfaceEvidence
+        [Parameter(Mandatory)][string]$UiDirectory,
+        [Parameter(Mandatory)][hashtable]$InterfaceEvidence,
+        [ValidateSet('Release', 'Debug')][string]$BuildProfile = 'Release'
     )
     $output = Assert-PackageWorkspacePath $OutputDirectory $WorkspaceRoot
     $archive = Assert-PackageWorkspacePath ($output + '.zip') $WorkspaceRoot
@@ -396,7 +432,11 @@ function New-KaleidoscopePackage {
         'Transfiguration-README.md' = (Join-Path $BridgeDirectory 'README.md')
     }
     foreach ($name in $script:licenseNames) { $sources["licenses/$name"] = Join-Path $BridgeDirectory "licenses/$name" }
+    $UiDirectory = Assert-PackageWorkspacePath $UiDirectory $WorkspaceRoot
+    $sources['Kaleidoscope-THIRD-PARTY-NOTICES.md'] = Join-Path $UiDirectory 'THIRD-PARTY-NOTICES.md'
+    foreach ($name in @('Nunito.txt', 'NotoSansTC.txt')) { $sources["licenses/$name"] = Join-Path $UiDirectory "licenses/$name" }
     foreach ($name in $sources.Keys) {
+        $null = Assert-PackageWorkspacePath $sources[$name] $WorkspaceRoot
         $source = Get-Item -LiteralPath $sources[$name] -Force
         if ($source.PSIsContainer -or $source.Length -eq 0 -or $source.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) { throw "Missing or invalid package source: $name" }
     }
@@ -421,17 +461,23 @@ function New-KaleidoscopePackage {
     [IO.Directory]::CreateDirectory((Join-Path $stage 'licenses')) | Out-Null
     foreach ($name in $sources.Keys) { Copy-Item -LiteralPath $sources[$name] -Destination (Join-Path $stage $name) }
     $readme = @'
-Kaleidoscope — Illyaverse local test package
+Kaleidoscope — Illyaverse local test package (__BUILD_PROFILE__)
 
 Run Kaleidoscope.exe, choose the installed stable/lazer osu!.exe, then launch.
-This package is fixed to https://illya.test and requires the documented local
-DNS/CA setup. It is a local test artifact; public download is not promised.
+The default endpoint is https://illya.test. Settings accept a validated HTTPS
+origin for the next launch; an active session keeps its selected origin. The
+illya.test setup requires the documented local DNS/CA. TLS remains required;
+official osu! fallback is disabled. Stable requires the default HTTPS port 443;
+lazer also supports custom HTTPS ports. This is a local test artifact.
 Lazer updates outside the tested build stop before Main. Update the complete
 launcher and bridge package together; do not copy this DLL into official rulesets.
 Lazer uses your existing beatmap library, including configured custom/portable
-storage. Private account and game settings use game.illyaverse.ini in that same
-data folder; official game.ini credentials are not read, copied or overwritten.
-Private game preferences start at defaults on first use. Changing the data folder
+storage. Gameplay, UI, audio and input settings remain shared in original
+game.ini. Only account/session state and remember-login flags use
+auth.illyaverse.json in that same library, with a separate profile for each
+canonical endpoint. Official account fields are filtered before private API use
+and preserved when saving shared settings. Old game.illyaverse.ini is not
+copied or migrated. Changing the data folder
 requires closing the private client and configuring the normal lazer client.
 Close the game to remove the temporary DLL from the existing rulesets folder.
 The independent guardian survives closing this window. After an interrupted
@@ -441,14 +487,18 @@ files are kept.
 Native GUI/gameplay/login remains pending user-operated verification. Package
 integrity and embedded-interface evidence do not prove a real game session.
 See Transfiguration-README.md, compatibility.json, and THIRD-PARTY-NOTICES.md.
+GUI font licenses and provenance are in Kaleidoscope-THIRD-PARTY-NOTICES.md
+and licenses/Nunito.txt and licenses/NotoSansTC.txt.
 '@
+    $buildLabel = if ($synthetic) { 'synthetic integrity fixture; no executable build' } elseif ($BuildProfile -eq 'Debug') { 'debug GUI connection test build' } else { 'release GUI build' }
+    $readme = $readme.Replace('__BUILD_PROFILE__', $buildLabel)
     [IO.File]::WriteAllText((Join-Path $stage 'README.txt'), $readme, [Text.UTF8Encoding]::new($false))
     $hashes = [ordered]@{}
-    foreach ($name in $script:payloadNames) { $hashes[$name] = (Get-FileHash -LiteralPath (Join-Path $stage $name) -Algorithm SHA256).Hash.ToLowerInvariant() }
+    foreach ($name in $script:guiPayloadNames) { $hashes[$name] = (Get-FileHash -LiteralPath (Join-Path $stage $name) -Algorithm SHA256).Hash.ToLowerInvariant() }
     if ($hashes['Kaleidoscope.exe'] -ine $InterfaceEvidence.launcher_sha256 -or $hashes['compatibility.json'] -ine $expectedCompatibilityHash) { throw 'Verified launcher or compatibility changed during package assembly.' }
     # Completion metadata is the final file written, after every required payload file.
     $manifest = [ordered]@{
-        version = 1; status = 'complete'; server = 'https://illya.test'; fixture = $false; bridge_sha256 = $bridgeHash
+        version = 1; status = 'complete'; default_endpoint = 'https://illya.test'; endpoint_mode = 'https_origin_per_session'; configurable_endpoint = $true; fixture = $false; build_profile = $(if ($synthetic) { 'synthetic' } else { $BuildProfile.ToLowerInvariant() }); bridge_sha256 = $bridgeHash
         embedded_interface_verified = !$synthetic; native_gui_verified = $false; verification_kind = $InterfaceEvidence.kind
         completed_at_utc = [DateTime]::UtcNow.ToString('o'); content_sha256 = $hashes
     }

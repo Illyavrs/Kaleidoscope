@@ -37,11 +37,32 @@ h1, h2 { text-wrap: balance; }
 .preview-note { display: flex; align-items: center; gap: 8px; margin: -6px 0 16px; color: var(--muted-foreground); font-size: 11px; }
 .launcher-panel { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); backdrop-filter: blur(24px); overflow: hidden; }
 .server-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 22px; border-bottom: 1px solid var(--border); }
-.server-label { display: flex; align-items: center; gap: 9px; }
+.server-label { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.server-label > div { min-width: 0; }
 .server-label svg { color: var(--primary); }
 .server-label strong { font-size: 14px; font-weight: 800; }
-.server-label p { font-size: 10px; color: var(--muted-foreground); }
+.server-label p { font-size: 11px; color: var(--muted-foreground); overflow-wrap: anywhere; }
 .server-row > span { font-size: 11px; color: var(--muted-foreground); }
+.server-row > .button { flex-shrink: 0; }
+.settings-panel { padding: 16px 22px; border-bottom: 1px solid var(--border); }
+.settings-heading { margin-bottom: 12px; }
+.settings-heading h2 { font-size: 14px; line-height: 1.4; font-weight: 800; }
+.settings-heading p { margin-top: 4px; color: var(--muted-foreground); font-size: 12px; }
+.settings-panel label { display: block; margin-bottom: 5px; font-size: 12px; font-weight: 700; }
+.settings-panel input { width: 100%; min-width: 0; height: 38px; padding: 0 11px; border-radius: 9px; border: 1px solid var(--input); color: var(--foreground); background: var(--background); font-size: 14px; }
+.settings-panel input::placeholder { color: var(--muted-foreground); opacity: 1; }
+.settings-panel input[aria-invalid="true"] { border-color: var(--destructive); }
+.settings-panel input:disabled { opacity: .6; }
+.settings-hint { margin-top: 5px; font-size: 11px; color: var(--muted-foreground); }
+.active-endpoint { margin-top: 8px; font-size: 11px; color: var(--muted-foreground); overflow-wrap: anywhere; }
+.active-endpoint span { color: var(--foreground); }
+.settings-error { margin-top: 8px; font-size: 12px; color: var(--destructive); overflow-wrap: anywhere; }
+.settings-actions { display: flex; justify-content: space-between; gap: 8px; align-items: center; margin-top: 12px; }
+.settings-actions > div { display: flex; align-items: center; gap: 10px; }
+.settings-actions > .button { padding-inline: 0; }
+.settings-saved { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--ranked); }
+.settings-load-error { display: flex; gap: 12px; align-items: center; justify-content: space-between; padding: 12px 22px; border-bottom: 1px solid var(--border); }
+.settings-load-error p { color: var(--destructive); font-size: 12px; }
 .client-row { padding: 16px 22px 14px; }
 .client-row + .client-row { border-top: 1px solid var(--border); }
 .client-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
@@ -83,6 +104,10 @@ h1, h2 { text-wrap: balance; }
   .brand-name { display: none; }
   .server-row { padding: 14px 16px; }
   .server-row > span { font-size: 10px; }
+  .settings-panel { padding: 16px; }
+  .settings-panel input { font-size: 16px; }
+  .settings-heading p { font-size: 12px; }
+  .settings-load-error { padding: 12px 16px; }
   .client-row { padding: 19px 16px 17px; }
   .client-heading h2 { font-size: 18px; }
   .client-heading p { max-width: 26ch; }

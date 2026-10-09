@@ -1,6 +1,7 @@
 param(
     [string]$NativeRoot = (Join-Path $env:LOCALAPPDATA 'osulazer/current'),
-    [string]$OutputDirectory
+    [string]$OutputDirectory,
+    [ValidateSet('Release', 'Debug')][string]$BuildProfile = 'Release'
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -11,6 +12,7 @@ if (!$OutputDirectory) {
     $OutputDirectory = Join-Path $repo ('data-kaleidoscope-package-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N'))
 }
 $output = Assert-PackageWorkspacePath $OutputDirectory $repo
+$cargoTarget = Assert-PackageWorkspacePath (Join-Path $repo 'target') $repo
 if ((Test-Path -LiteralPath $output) -or (Test-Path -LiteralPath ($output + '.zip'))) { throw 'Package output or ZIP already exists; choose a new output directory.' }
 if (!(Test-Path -LiteralPath ([IO.Path]::GetDirectoryName($output)) -PathType Container)) { throw 'Package parent directory must already exist.' }
 foreach ($required in @('osu.Game.dll','osu.Framework.dll','osu!.dll','hostfxr.dll')) {
@@ -25,23 +27,25 @@ function Assert-Build([string]$step) {
 Push-Location $repo
 try {
     $env:CARGO_INCREMENTAL = '0'
-    $env:CARGO_TARGET_DIR = Join-Path $repo 'target'
+    $env:CARGO_TARGET_DIR = $cargoTarget
     $bridgeOutput = Join-Path $repo 'tools/transfiguration/artifacts'
     & ./tools/transfiguration/build.ps1 -NativeRoot $native
     Assert-Build 'Original connection bridge build'
     $bridge = Join-Path $bridgeOutput 'osu.Game.Rulesets.Transfiguration.dll'
     $env:ILLYA_BRIDGE_SHA256 = (Get-FileHash -LiteralPath $bridge -Algorithm SHA256).Hash.ToLowerInvariant()
     $bridgeManifest = Get-Content -LiteralPath (Join-Path $bridgeOutput 'artifact.json') -Raw | ConvertFrom-Json
-    if ($bridgeManifest.protocol -ne 1 -or $bridgeManifest.fixture -ne $false -or $bridgeManifest.endpoint -ne 'https://illya.test' -or $bridgeManifest.sha256 -ne $env:ILLYA_BRIDGE_SHA256) { throw 'Production bridge manifest validation failed.' }
+    if ($bridgeManifest.protocol -ne 1 -or $bridgeManifest.fixture -ne $false -or $bridgeManifest.default_endpoint -cne 'https://illya.test' -or $bridgeManifest.endpoint_mode -cne 'https_origin_per_session' -or $bridgeManifest.configurable_endpoint -isnot [bool] -or !$bridgeManifest.configurable_endpoint -or $bridgeManifest.sha256 -ne $env:ILLYA_BRIDGE_SHA256) { throw 'Production bridge manifest validation failed.' }
     & npm run build --workspace '@illyaverse/kaleidoscope'
     Assert-Build 'Launcher interface build'
-    & cargo build --manifest-path tools/kaleidoscope/ui/src-tauri/Cargo.toml --release --locked --features custom-protocol
+    $cargoArguments = @('build', '--manifest-path', 'tools/kaleidoscope/ui/src-tauri/Cargo.toml', '--locked', '--features', 'custom-protocol')
+    if ($BuildProfile -eq 'Release') { $cargoArguments += '--release' }
+    & cargo @cargoArguments
     Assert-Build 'Native launcher build'
-    $launcher = Join-Path $repo 'target/release/kaleidoscope-desktop.exe'
+    $launcher = Assert-PackageWorkspacePath (Join-Path $cargoTarget ($BuildProfile.ToLowerInvariant() + '/kaleidoscope-desktop.exe')) $repo
     $launcherHash = (Get-FileHash -LiteralPath $launcher -Algorithm SHA256).Hash.ToLowerInvariant()
     $interfaceProof = Start-Process -FilePath $launcher -ArgumentList '--verify-embedded-interface' -WindowStyle Hidden -Wait -PassThru
     if ($interfaceProof.ExitCode -ne 0) { throw 'Embedded production interface verification failed; no launcher is ready to distribute.' }
-    $package = New-KaleidoscopePackage -WorkspaceRoot $repo -LauncherPath $launcher -BridgeDirectory $bridgeOutput -LicensePath (Join-Path $repo 'LICENSE') -ExpectedCompatibilityPath (Join-Path $repo 'tools/transfiguration/compatibility.json') -OutputDirectory $output -InterfaceEvidence @{ kind = 'embedded_interface_command'; launcher_sha256 = $launcherHash; exit_code = $interfaceProof.ExitCode }
+    $package = New-KaleidoscopePackage -WorkspaceRoot $repo -LauncherPath $launcher -BridgeDirectory $bridgeOutput -LicensePath (Join-Path $repo 'LICENSE') -ExpectedCompatibilityPath (Join-Path $repo 'tools/transfiguration/compatibility.json') -OutputDirectory $output -UiDirectory (Join-Path $repo 'tools/kaleidoscope/ui') -BuildProfile $BuildProfile -InterfaceEvidence @{ kind = 'embedded_interface_command'; launcher_sha256 = $launcherHash; exit_code = $interfaceProof.ExitCode }
     Write-Output "Validated local test package: $($package.Directory)"
     Write-Output "Validated local ZIP: $($package.Archive)"
     Write-Output 'Uses the player installed client; no official client/resources are redistributed. No game was launched.'

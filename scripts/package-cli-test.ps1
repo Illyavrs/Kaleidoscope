@@ -22,7 +22,7 @@ $expectedCompatibilityPath = Assert-PackageWorkspacePath (Join-Path $repo 'tools
 $licensePath = Assert-PackageWorkspacePath (Join-Path $repo 'LICENSE') $repo
 $bridgeHash = (Get-FileHash -LiteralPath $bridge -Algorithm SHA256).Hash.ToLowerInvariant()
 $artifact = Get-Content -LiteralPath $artifactPath -Raw | ConvertFrom-Json -AsHashtable
-if ($artifact.protocol -ne 1 -or $artifact.fixture -isnot [bool] -or $artifact.fixture -ne $false -or $artifact.endpoint -cne 'https://illya.test' -or $artifact.artifact -cne 'osu.Game.Rulesets.Transfiguration.dll' -or $artifact.sha256 -cne $bridgeHash) { throw 'Production bridge preflight failed.' }
+if ($artifact.protocol -ne 1 -or $artifact.fixture -isnot [bool] -or $artifact.fixture -ne $false -or $artifact.default_endpoint -cne 'https://illya.test' -or $artifact.endpoint_mode -cne 'https_origin_per_session' -or $artifact.configurable_endpoint -isnot [bool] -or !$artifact.configurable_endpoint -or $artifact.artifact -cne 'osu.Game.Rulesets.Transfiguration.dll' -or $artifact.sha256 -cne $bridgeHash) { throw 'Production bridge preflight failed.' }
 if ((Get-FileHash -LiteralPath $compatibilityPath -Algorithm SHA256).Hash -ine (Get-FileHash -LiteralPath $expectedCompatibilityPath -Algorithm SHA256).Hash) { throw 'Production compatibility preflight failed.' }
 $previousHash = [Environment]::GetEnvironmentVariable('ILLYA_BRIDGE_SHA256', 'Process')
 $previousIncremental = [Environment]::GetEnvironmentVariable('CARGO_INCREMENTAL', 'Process')

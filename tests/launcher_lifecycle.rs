@@ -1,9 +1,10 @@
+use fs2::FileExt;
 use kaleidoscope::launcher::install::{
     artifact_sha256, CleanupOutcome, LifecycleState, ManagedRuleset, JOURNAL_FILENAME,
     RULESET_FILENAME,
 };
 use serde_json::Value;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -113,6 +114,42 @@ fn exclusive_session_lock_is_released_on_drop_and_recovery_owns_old_session() {
     let mut next_session = fixture.manager();
     assert_eq!(next_session.recover().unwrap(), CleanupOutcome::Recovered);
     assert!(!fixture.root.join(RULESET_FILENAME).exists());
+}
+
+#[test]
+fn renamed_lock_preserves_and_coordinates_with_both_legacy_and_new_inodes() {
+    let fixture = Fixture::new();
+    let legacy = fixture.root.join(".illyaverse-launcher.lock");
+    let current = fixture.root.join(".kaleidoscope.lock");
+    fs::write(&legacy, b"existing legacy lock marker").unwrap();
+    let old_launcher = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&legacy)
+        .unwrap();
+    old_launcher.try_lock_exclusive().unwrap();
+    assert!(ManagedRuleset::open(&fixture.root).is_err());
+    assert!(!current.exists());
+    FileExt::unlock(&old_launcher).unwrap();
+    let manager = fixture.manager();
+    let new_launcher = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&current)
+        .unwrap();
+    assert!(old_launcher.try_lock_exclusive().is_err());
+    assert!(new_launcher.try_lock_exclusive().is_err());
+    drop(manager);
+    assert_eq!(fs::read(&legacy).unwrap(), b"existing legacy lock marker");
+    assert!(legacy.exists() && current.exists());
+    old_launcher.try_lock_exclusive().unwrap();
+    FileExt::unlock(&old_launcher).unwrap();
+    new_launcher.try_lock_exclusive().unwrap();
+    assert!(ManagedRuleset::open(&fixture.root).is_err());
+    // Failure on the new inode releases the already acquired legacy lock.
+    old_launcher.try_lock_exclusive().unwrap();
+    FileExt::unlock(&old_launcher).unwrap();
+    FileExt::unlock(&new_launcher).unwrap();
 }
 
 #[test]

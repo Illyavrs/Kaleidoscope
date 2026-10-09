@@ -16,7 +16,8 @@ use uuid::Uuid;
 
 pub const RULESET_FILENAME: &str = "osu.Game.Rulesets.Transfiguration.dll";
 pub const JOURNAL_FILENAME: &str = ".illyaverse-launcher.session.json";
-const LOCK_FILENAME: &str = ".illyaverse-launcher.lock";
+const LOCK_FILENAME: &str = ".kaleidoscope.lock";
+const LEGACY_LOCK_FILENAME: &str = ".illyaverse-launcher.lock";
 const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_JOURNAL_BYTES: u64 = 16 * 1024;
 
@@ -65,6 +66,7 @@ pub struct ManagedRuleset {
     root: PathBuf,
     root_identity: String,
     lock: File,
+    legacy_lock: File,
 }
 
 impl ManagedRuleset {
@@ -73,33 +75,15 @@ impl ManagedRuleset {
     pub fn open(ruleset_root: impl AsRef<Path>) -> Result<Self> {
         let root = checked_directory(ruleset_root.as_ref())?;
         let root_identity = directory_identity(&root)?;
-        let lock_path = root.join(LOCK_FILENAME);
-        let lock = match fresh_file(&lock_path) {
-            Ok(lock) => lock,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                check_regular_file(&lock_path)?;
-                OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&lock_path)
-                    .map_err(|error| format!("Cannot open launcher lock: {error}"))?
-            }
-            Err(error) => return Err(format!("Cannot create launcher lock: {error}")),
-        };
-        reject_link(&lock.metadata().map_err(|error| error.to_string())?)?;
-        if !lock
-            .metadata()
-            .map_err(|error| error.to_string())?
-            .is_file()
-        {
-            return Err("Launcher lock is not a regular file".into());
-        }
-        FileExt::try_lock_exclusive(&lock)
-            .map_err(|_| "Another launcher session owns this ruleset directory".to_owned())?;
+        // Older launchers know only the legacy inode. Lock it first and retain
+        // both files so mixed versions cannot install into the same directory.
+        let legacy_lock = open_ruleset_lock(&root.join(LEGACY_LOCK_FILENAME))?;
+        let lock = open_ruleset_lock(&root.join(LOCK_FILENAME))?;
         let guard = Self {
             root,
             root_identity,
             lock,
+            legacy_lock,
         };
         guard.check_root()?;
         Ok(guard)
@@ -371,9 +355,33 @@ impl ManagedRuleset {
 impl Drop for ManagedRuleset {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.lock);
+        let _ = FileExt::unlock(&self.legacy_lock);
         // Keep the lock inode: removing it could let a second process lock a new
         // inode while another process still owns the old one.
     }
+}
+
+fn open_ruleset_lock(lock_path: &Path) -> Result<File> {
+    let lock = match fresh_file(lock_path) {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            check_regular_file(lock_path)?;
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(lock_path)
+                .map_err(|error| format!("Cannot open launcher lock: {error}"))?
+        }
+        Err(error) => return Err(format!("Cannot create launcher lock: {error}")),
+    };
+    let metadata = lock.metadata().map_err(|error| error.to_string())?;
+    reject_link(&metadata)?;
+    if !metadata.is_file() {
+        return Err("Launcher lock is not a regular file".into());
+    }
+    FileExt::try_lock_exclusive(&lock)
+        .map_err(|_| "Another launcher session owns this ruleset directory".to_owned())?;
+    Ok(lock)
 }
 
 /// Useful for packaging a manifest, but callers must obtain the trusted expected

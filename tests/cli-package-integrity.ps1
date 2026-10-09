@@ -155,9 +155,15 @@ try {
     Expect-Refusal 'Win32 version query refuses missing resource before reading a root pointer' { Read-KaleidoscopeVersionResource $missingVersion } '*Missing or oversized Windows VERSIONINFO resource*'
     $bindings = (& (Join-Path $package 'Kaleidoscope.exe') --inspect-package-bindings | Out-String) | ConvertFrom-Json -AsHashtable
     Assert-Check ($LASTEXITCODE -eq 0 -and $bindings.bridge_verified -eq $true -and $bindings.official_fallback -eq $false -and $bindings.shared_existing_library -eq $true) 'actual production-bound CLI diagnostic passes'
+    Assert-Check ($bindings.default_endpoint -ceq 'https://illya.test' -and $bindings.endpoint_mode -ceq 'https_origin_per_session' -and $bindings.configurable_endpoint -eq $true -and $bindings.private_auth_filename -ceq 'auth.illyaverse.json' -and $bindings.shared_game_preferences -eq $true) 'actual CLI binds configurable endpoints, private auth and shared game preferences'
     $manifest = Read-FixtureJson (Join-Path $package 'package.json')
     Assert-Check ($manifest.artifact_kind -ceq 'cli_connection_test' -and $manifest.native_gui_verified -eq $false -and $manifest.native_login_verified -eq $false) 'CLI manifest keeps GUI and login unverified'
     Expect-Refusal 'desktop GUI verifier rejects CLI-only evidence' { Test-KaleidoscopePackage -Directory $package }
+    foreach ($name in @('licenses/Nunito.txt', 'licenses/NotoSansTC.txt', 'Kaleidoscope-THIRD-PARTY-NOTICES.md')) {
+        $withGuiFont = Copy-Fixture ('gui-font-' + [IO.Path]::GetFileNameWithoutExtension($name))
+        [IO.File]::WriteAllText((Join-Path $withGuiFont $name), 'synthetic GUI-only font payload; never loaded')
+        Expect-Refusal 'CLI package rejects GUI-only font payload' { Test-KaleidoscopeCliTestPackage -Directory $withGuiFont } '*Unexpected or empty package file*'
+    }
 
     $constructor = @{
         WorkspaceRoot = $repo; LauncherPath = (Join-Path $package 'Kaleidoscope.exe')
@@ -221,12 +227,19 @@ try {
     Write-Json (Join-Path $wrong 'artifact.json') $artifact
     Expect-DiagnosticRefusal $wrong 'metadata-replaced-wrong-bridge'
 
-    foreach ($field in @('official_fallback', 'private_config_filename', 'native_login_verified', 'artifact_kind')) {
+    foreach ($field in @('official_fallback', 'private_auth_filename', 'obsolete_auth_filename', 'shared_game_preferences', 'shared_preferences_type', 'obsolete_private_config', 'old_config_shape', 'configurable_endpoint', 'endpoint_mode', 'native_login_verified', 'artifact_kind')) {
         $tampered = Copy-Fixture ('policy-' + $field)
         $value = Read-FixtureJson (Join-Path $tampered 'package.json')
         switch ($field) {
             'official_fallback' { $value.package_bindings.official_fallback = $true }
-            'private_config_filename' { $value.package_bindings.private_config_filename = 'game.ini' }
+            'private_auth_filename' { $value.package_bindings.private_auth_filename = 'game.ini' }
+            'obsolete_auth_filename' { $value.package_bindings.private_auth_filename = 'game.illyaverse.ini' }
+            'shared_game_preferences' { $value.package_bindings.shared_game_preferences = $false }
+            'shared_preferences_type' { $value.package_bindings.shared_game_preferences = 'true' }
+            'obsolete_private_config' { $value.package_bindings.private_config_filename = 'game.illyaverse.ini' }
+            'old_config_shape' { $value.package_bindings.Remove('private_auth_filename'); $value.package_bindings.Remove('shared_game_preferences'); $value.package_bindings.private_config_filename = 'game.illyaverse.ini' }
+            'configurable_endpoint' { $value.package_bindings.configurable_endpoint = $false }
+            'endpoint_mode' { $value.package_bindings.endpoint_mode = 'fixed' }
             'native_login_verified' { $value.native_login_verified = $true }
             'artifact_kind' { $value.artifact_kind = 'gui' }
         }

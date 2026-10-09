@@ -1,11 +1,25 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-use kaleidoscope::launcher::runtime::{self, Client, Snapshot};
+use kaleidoscope::launcher::runtime::{self, Client, LauncherSettings, Snapshot};
 use tauri_plugin_dialog::DialogExt;
 
 #[tauri::command]
 fn launcher_snapshot() -> Result<Snapshot, String> {
     runtime::snapshot()
+}
+
+#[tauri::command]
+async fn launcher_settings() -> Result<LauncherSettings, String> {
+    tauri::async_runtime::spawn_blocking(runtime::launcher_settings)
+        .await
+        .map_err(|_| "Server settings could not be read".to_owned())?
+}
+
+#[tauri::command]
+async fn launcher_set_endpoint(endpoint: String) -> Result<LauncherSettings, String> {
+    tauri::async_runtime::spawn_blocking(move || runtime::launcher_set_endpoint(&endpoint))
+        .await
+        .map_err(|_| "Server settings could not be saved".to_owned())?
 }
 
 #[tauri::command]
@@ -158,6 +172,8 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             launcher_snapshot,
+            launcher_settings,
+            launcher_set_endpoint,
             launcher_choose_path,
             launcher_start,
             launcher_stop,

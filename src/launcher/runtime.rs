@@ -1,6 +1,7 @@
-//! Fixed-server launcher sessions. An independent guardian owns installation,
+//! Per-session endpoint launcher sessions. An independent guardian owns installation,
 //! client lifetime, and exact-file cleanup even after the visible UI closes.
 
+use super::endpoint::Endpoint;
 use super::install::{artifact_sha256, ManagedRuleset, RULESET_FILENAME};
 use super::storage::Library;
 use super::{host, process, storage};
@@ -16,7 +17,6 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const SERVER: &str = "https://illya.test";
-const DOMAIN: &str = "illya.test";
 // Only stock assemblies independently inspected and tested with the bridge.
 const SUPPORTED_GAME_SHA256: &str =
     "ad9527e411111cb4b4045c76df61c3474fd872a04af73160c05d24e44a588249";
@@ -83,6 +83,12 @@ pub struct Snapshot {
     pub phase: Phase,
     pub detail: String,
     pub plugin_present: bool,
+    pub active_endpoint: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LauncherSettings {
+    pub endpoint: String,
 }
 
 /// Package-only diagnostics. This command reads the launcher and its adjacent
@@ -91,12 +97,15 @@ pub struct Snapshot {
 pub struct PackageBindings {
     pub protocol: u8,
     pub artifact_kind: &'static str,
-    pub server: &'static str,
+    pub default_endpoint: &'static str,
+    pub endpoint_mode: &'static str,
+    pub configurable_endpoint: bool,
     pub bridge_sha256: String,
     pub bridge_verified: bool,
     pub official_fallback: bool,
     pub shared_existing_library: bool,
-    pub private_config_filename: &'static str,
+    pub private_auth_filename: &'static str,
+    pub shared_game_preferences: bool,
     pub supported_assemblies: std::collections::BTreeMap<&'static str, &'static str>,
 }
 
@@ -109,12 +118,15 @@ pub fn inspect_package_bindings() -> Result<PackageBindings> {
     Ok(PackageBindings {
         protocol: 1,
         artifact_kind: "cli_connection_test",
-        server: SERVER,
+        default_endpoint: SERVER,
+        endpoint_mode: "https_origin_per_session",
+        configurable_endpoint: true,
         bridge_sha256: hash.to_owned(),
         bridge_verified: true,
         official_fallback: false,
         shared_existing_library: true,
-        private_config_filename: "game.illyaverse.ini",
+        private_auth_filename: "auth.illyaverse.json",
+        shared_game_preferences: true,
         supported_assemblies: std::collections::BTreeMap::from([
             ("osu.Game.dll", SUPPORTED_GAME_SHA256),
             ("osu.Framework.dll", SUPPORTED_FRAMEWORK_SHA256),
@@ -128,6 +140,8 @@ pub fn inspect_package_bindings() -> Result<PackageBindings> {
 struct Preferences {
     stable: Option<PathBuf>,
     lazer: Option<PathBuf>,
+    #[serde(default)]
+    endpoint: Endpoint,
 }
 
 impl Preferences {
@@ -145,6 +159,8 @@ struct Session {
     version: u8,
     nonce: String,
     client: Client,
+    #[serde(default)]
+    endpoint: Option<Endpoint>,
     selected_executable: PathBuf,
     selected_identity: String,
     launcher_executable: PathBuf,
@@ -171,6 +187,12 @@ struct Session {
     child_exit: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_progress: Option<ProgressStage>,
+}
+
+impl Session {
+    fn endpoint(&self) -> &Endpoint {
+        self.endpoint.as_ref().expect("validated session endpoint")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -227,7 +249,25 @@ struct Failure {
     stage: String,
     code: String,
     exception: String,
+    #[serde(default, skip_serializing_if = "FailureEndpoint::is_legacy")]
+    endpoint: FailureEndpoint,
     fixture: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+enum FailureEndpoint {
+    Selected(String),
+    Unavailable,
+    #[default]
+    #[serde(skip)]
+    LegacyMissing,
+}
+
+impl FailureEndpoint {
+    fn is_legacy(&self) -> bool {
+        matches!(self, Self::LegacyMissing)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -314,13 +354,39 @@ fn refuse_other_lazer_instances() -> Result<()> {
     Ok(())
 }
 
-/// Returns only client paths and launcher state. No hostname setting is exposed.
+/// Returns client paths, launcher state and the immutable active session endpoint.
 pub fn snapshot() -> Result<Snapshot> {
     snapshot_at(&Paths::production()?)
 }
 
+pub fn launcher_settings() -> Result<LauncherSettings> {
+    settings_at(&Paths::production()?)
+}
+
+/// Saves the next launch's endpoint. A live session keeps its captured endpoint.
+pub fn launcher_set_endpoint(endpoint: &str) -> Result<LauncherSettings> {
+    save_endpoint_at(&Paths::production()?, endpoint)
+}
+
+fn settings_at(paths: &Paths) -> Result<LauncherSettings> {
+    Ok(LauncherSettings {
+        endpoint: read_preferences(paths)?.endpoint.as_str().to_owned(),
+    })
+}
+
+fn save_endpoint_at(paths: &Paths, endpoint: &str) -> Result<LauncherSettings> {
+    let endpoint = Endpoint::parse(endpoint)?;
+    let _lock = ControlLock::open(paths)?;
+    let mut preferences = read_preferences(paths)?;
+    preferences.endpoint = endpoint;
+    write_json(&paths.prefs(), &preferences)?;
+    Ok(LauncherSettings {
+        endpoint: preferences.endpoint.as_str().to_owned(),
+    })
+}
+
 /// The caller owns the native file chooser; this validates and stores one client
-/// executable path. Preferences never contain commands, arguments, or servers.
+/// executable path. Preferences never contain commands or arguments.
 pub fn save_client_path(client: Client, executable: impl AsRef<Path>) -> Result<Snapshot> {
     let paths = Paths::production()?;
     let executable = validate_client(executable.as_ref(), client)?;
@@ -384,6 +450,9 @@ fn wait_for_start(mut read: impl FnMut() -> Result<Session>, timeout: Duration) 
 
 fn start_session(paths: &Paths, client: Client) -> Result<String> {
     let preferences = read_preferences(paths)?;
+    if client == Client::Stable {
+        preferences.endpoint.stable_domain()?;
+    }
     let selected = preferences
         .path(client)
         .ok_or("請先選擇 osu!.exe 安裝路徑")?;
@@ -422,9 +491,10 @@ fn start_session(paths: &Paths, client: Client) -> Result<String> {
     }
     let nonce = fresh_nonce()?;
     let session = Session {
-        version: 2,
+        version: 3,
         nonce: nonce.clone(),
         client,
+        endpoint: Some(preferences.endpoint.clone()),
         selected_identity: process::executable_identity(&selected)?,
         selected_executable: selected,
         launcher_identity: process::executable_identity(&paths.launcher)?,
@@ -549,9 +619,14 @@ fn snapshot_at(paths: &Paths) -> Result<Snapshot> {
             .map(|session| session.phase)
             .unwrap_or(Phase::Idle),
         detail: session
-            .map(|session| session.detail)
+            .as_ref()
+            .map(|session| session.detail.clone())
             .unwrap_or_else(|| "選擇遊戲安裝路徑以連線至 Illyaverse".into()),
         plugin_present,
+        active_endpoint: session
+            .as_ref()
+            .filter(|record| !session_completed(record))
+            .map(|record| record.endpoint().as_str().to_owned()),
     })
 }
 
@@ -687,7 +762,7 @@ fn recover_at(paths: &Paths) -> Result<()> {
     if let Some(mut session) = session {
         cleanup_session_ready(paths, &session)?;
         cleanup_failure(paths, &session.nonce)?;
-        cleanup_progress(paths, &session.nonce)?;
+        cleanup_progress(paths, &session.nonce, session.endpoint())?;
         session.phase = Phase::Idle;
         session.detail = "已關閉遊戲並移除 Illyaverse 連線模組".into();
         session.guardian = None;
@@ -759,9 +834,9 @@ fn run_guardian(paths: &Paths, nonce: &str) -> Result<i32> {
             .and_then(|()| managed.cleanup().map(|_| ())),
         None => Ok(()),
     }
-    .and_then(|()| cleanup_ready(paths, nonce))
+    .and_then(|()| cleanup_ready(paths, nonce, session.endpoint()))
     .and_then(|()| cleanup_failure(paths, nonce))
-    .and_then(|()| cleanup_progress(paths, nonce));
+    .and_then(|()| cleanup_progress(paths, nonce, session.endpoint()));
     let _lock = ControlLock::open(paths)?;
     let mut current = matching_session(paths, nonce)?;
     current.guardian = None;
@@ -827,7 +902,9 @@ fn run_client(
     match session.client {
         Client::Stable => {
             command = Command::new(&selected);
-            command.arg("-devserver").arg(DOMAIN);
+            command
+                .arg("-devserver")
+                .arg(session.endpoint().stable_domain()?);
         }
         Client::Lazer => {
             let (bridge, hash) = verify_bridge(paths)?;
@@ -858,6 +935,10 @@ fn run_client(
             command.env("ILLYAVERSE_LAZER_CONTROL_ROOT", &paths.control);
             command.env("ILLYAVERSE_LAZER_SESSION", &session.nonce);
             command.env("ILLYAVERSE_LAZER_READY_FILE", paths.ready(&session.nonce));
+            command.env(
+                "ILLYAVERSE_LAZER_SERVER_ENDPOINT",
+                session.endpoint().as_str(),
+            );
             command.env("OSU_DISABLE_ERROR_REPORTING", "1");
             command.env("OSU_EXTERNAL_UPDATE_PROVIDER", "Illyaverse");
         }
@@ -889,7 +970,12 @@ fn run_client(
         }
         let record = matching_session(paths, &session.nonce)?;
         if session.client == Client::Lazer && !started {
-            if let Some(failure) = read_failure(paths, &session.nonce)? {
+            if let Some(failure) = read_failure(
+                paths,
+                &session.nonce,
+                session.endpoint(),
+                session.version < 3,
+            )? {
                 let detail = failure_detail(&failure, record.host_status, None);
                 update_session(paths, &session.nonce, |record| {
                     record.failure = Some(failure)
@@ -898,7 +984,7 @@ fn run_client(
             }
             if !guard_verified {
                 if let Some(signal) = read_ready(paths, &session.nonce)? {
-                    validate_ready(&signal, &session.nonce)?;
+                    validate_ready(&signal, &session.nonce, session.endpoint())?;
                     if record.child.as_ref().map(process::state).transpose()?
                         != Some(process::State::Live)
                     {
@@ -909,7 +995,7 @@ fn run_client(
                     return Err("未收到安全啟動確認；關閉遊戲後才會清理連線模組".into());
                 }
             }
-            let progress = read_progress(paths, &session.nonce)?;
+            let progress = read_progress(paths, &session.nonce, session.endpoint())?;
             let child_state = record.child.as_ref().map(process::state).transpose()?;
             let _lock = ControlLock::open(paths)?;
             let mut current = matching_session(paths, &session.nonce)?;
@@ -1005,12 +1091,17 @@ fn finish_child_exit(
     // Consume the fixed safe failure before cleanup removes its sidecar. Raw
     // game stdout/stderr never enters this record or the public snapshot.
     let failure = if session.client == Client::Lazer {
-        read_failure(paths, &session.nonce)?
+        read_failure(
+            paths,
+            &session.nonce,
+            session.endpoint(),
+            session.version < 3,
+        )?
     } else {
         None
     };
     let progress = if session.client == Client::Lazer {
-        read_progress(paths, &session.nonce)?
+        read_progress(paths, &session.nonce, session.endpoint())?
     } else {
         None
     };
@@ -1062,9 +1153,15 @@ fn capture_closed_child(
     // A startup-hook failure may have been published after an earlier timeout,
     // or the first read may have raced its create/write. Re-read only after the
     // owned child has exited, and persist the strict safe record before cleanup.
+    let expected_session = matching_session(paths, nonce)?;
     let mut rejected = false;
     let observed = if client == Client::Lazer {
-        match read_failure(paths, nonce) {
+        match read_failure(
+            paths,
+            nonce,
+            expected_session.endpoint(),
+            expected_session.version < 3,
+        ) {
             Ok(failure) => failure,
             Err(error) => {
                 *result = Err(error);
@@ -1076,7 +1173,7 @@ fn capture_closed_child(
         None
     };
     let progress = if client == Client::Lazer {
-        match read_progress(paths, nonce) {
+        match read_progress(paths, nonce, expected_session.endpoint()) {
             Ok(progress) => progress,
             Err(error) => {
                 *result = Err(error);
@@ -1175,7 +1272,7 @@ fn run_lazer_host(paths: &Paths, nonce: &str) -> Result<i32> {
             .ok_or("lazer 缺少原有圖譜資料夾紀錄")?;
         library.validate()?;
         refuse_other_lazer_instances()?;
-        validate_child_environment(paths, nonce, install, library)?;
+        validate_child_environment(paths, nonce, install, library, session.endpoint())?;
         if path_exists(&paths.failure(nonce))? {
             return Err("lazer 工作階段已有失敗訊號；不會進入 Main".into());
         }
@@ -1214,22 +1311,22 @@ fn persist_host_failure(
     code: &str,
     status: Option<i32>,
 ) -> Result<i32> {
+    // Reached only after the host persisted its validated current identity.
+    let _lock = ControlLock::open(paths)?;
+    let mut session = matching_session(paths, nonce)?;
+    if session.child.as_ref() != Some(&process::current_identity()?) {
+        return Err("lazer 失敗紀錄缺少受管理的主機程序身分".into());
+    }
     let failure = Failure {
         protocol: 1,
         session: nonce.to_owned(),
         stage: "host".into(),
         code: code.to_owned(),
         exception: "native_host".into(),
+        endpoint: FailureEndpoint::Selected(session.endpoint().as_str().to_owned()),
         fixture: false,
     };
-    validate_failure(&failure, nonce)?;
-    // This function is reached only after run_lazer_host persisted the current
-    // validated child identity. Refuse a changed owner before publishing.
-    let _lock = ControlLock::open(paths)?;
-    let mut session = matching_session(paths, nonce)?;
-    if session.child.as_ref() != Some(&process::current_identity()?) {
-        return Err("lazer 失敗紀錄缺少受管理的主機程序身分".into());
-    }
+    validate_failure(&failure, nonce, session.endpoint(), session.version < 3)?;
     let file = paths.failure(nonce);
     check_components(&paths.control)?;
     let mut writer = OpenOptions::new()
@@ -1258,6 +1355,7 @@ fn validate_child_environment(
     nonce: &str,
     install: &Path,
     library: &Library,
+    endpoint: &Endpoint,
 ) -> Result<()> {
     for (name, expected) in [
         ("ILLYAVERSE_LAZER_INSTALL_ROOT", install.to_path_buf()),
@@ -1268,6 +1366,13 @@ fn validate_child_environment(
         if std::env::var_os(name).map(PathBuf::from).as_ref() != Some(&expected) {
             return Err("lazer 工作階段路徑環境不符".into());
         }
+    }
+    if std::env::var("ILLYAVERSE_LAZER_SERVER_ENDPOINT")
+        .ok()
+        .as_deref()
+        != Some(endpoint.as_str())
+    {
+        return Err("lazer 工作階段伺服器環境不符；不會進入 Main".into());
     }
     Ok(())
 }
@@ -1308,7 +1413,7 @@ fn read_preferences(paths: &Paths) -> Result<Preferences> {
 fn read_session(paths: &Paths) -> Result<Option<Session>> {
     let mut session: Option<Session> = read_json(&paths.session())?;
     if let Some(session) = &mut session {
-        if !matches!(session.version, 1 | 2)
+        if !matches!(session.version, 1..=3)
             || !valid_nonce(&session.nonce)
             || session.detail.len() > 4096
             || !session.selected_executable.is_absolute()
@@ -1325,6 +1430,15 @@ fn read_session(paths: &Paths) -> Result<Option<Session>> {
                 .any(|part| matches!(part, Component::ParentDir))
         {
             return Err("工作階段復原紀錄無效；現有檔案已保留".into());
+        }
+        match (&session.endpoint, session.version) {
+            (None, 1 | 2) => session.endpoint = Some(Endpoint::default()),
+            (Some(endpoint), 1 | 2) if endpoint == &Endpoint::default() => {}
+            (Some(_), 3) => {}
+            _ => return Err("工作階段缺少一致的伺服器紀錄；現有檔案已保留".into()),
+        }
+        if session.client == Client::Stable {
+            session.endpoint().stable_domain()?;
         }
         // The recorded launcher belongs to the historical session. Moving or
         // upgrading the current package must not prevent status or recovery;
@@ -1385,7 +1499,12 @@ fn read_session(paths: &Paths) -> Result<Option<Session>> {
             }
         }
         if let Some(failure) = &session.failure {
-            validate_failure(failure, &session.nonce)?;
+            validate_failure(
+                failure,
+                &session.nonce,
+                session.endpoint(),
+                session.version < 3,
+            )?;
             if session.client != Client::Lazer {
                 return Err("lazer 失敗紀錄不得屬於另一種遊戲工作階段".into());
             }
@@ -1411,12 +1530,12 @@ fn read_ready(paths: &Paths, nonce: &str) -> Result<Option<Ready>> {
     }
     read_json(&paths.ready(nonce))
 }
-fn validate_ready(signal: &Ready, nonce: &str) -> Result<()> {
+fn validate_ready(signal: &Ready, nonce: &str, endpoint: &Endpoint) -> Result<()> {
     if !valid_nonce(nonce)
         || signal.protocol != 1
         || signal.session != nonce
         || signal.status != "ready"
-        || signal.endpoint != SERVER
+        || signal.endpoint != endpoint.as_str()
         || signal.fixture
     {
         return Err("lazer 安全啟動訊號不符合正式私服契約".into());
@@ -1424,12 +1543,17 @@ fn validate_ready(signal: &Ready, nonce: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_progress(signal: &Progress, nonce: &str, stage: ProgressStage) -> Result<()> {
+fn validate_progress(
+    signal: &Progress,
+    nonce: &str,
+    stage: ProgressStage,
+    endpoint: &Endpoint,
+) -> Result<()> {
     if !valid_nonce(nonce)
         || signal.protocol != 1
         || signal.session != nonce
         || signal.stage != stage
-        || signal.endpoint != SERVER
+        || signal.endpoint != endpoint.as_str()
         || signal.fixture
     {
         return Err("lazer 進度訊號不符合正式工作階段契約；現有檔案已保留".into());
@@ -1448,7 +1572,12 @@ fn progress_io_pending(error: &std::io::Error) -> bool {
     cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33))
 }
 
-fn read_progress_file(path: &Path, nonce: &str, stage: ProgressStage) -> Result<ProgressRead> {
+fn read_progress_file(
+    path: &Path,
+    nonce: &str,
+    stage: ProgressStage,
+    endpoint: &Endpoint,
+) -> Result<ProgressRead> {
     if !valid_nonce(nonce) {
         return Err("lazer 進度紀錄的工作階段無效".into());
     }
@@ -1479,18 +1608,18 @@ fn read_progress_file(path: &Path, nonce: &str, stage: ProgressStage) -> Result<
         return Err(invalid.into());
     }
     let signal: Progress = serde_json::from_slice(&bytes).map_err(|_| invalid)?;
-    validate_progress(&signal, nonce, stage)?;
+    validate_progress(&signal, nonce, stage, endpoint)?;
     Ok(ProgressRead::Complete)
 }
 
-fn read_progress(paths: &Paths, nonce: &str) -> Result<Option<ProgressStage>> {
+fn read_progress(paths: &Paths, nonce: &str, endpoint: &Endpoint) -> Result<Option<ProgressStage>> {
     if !valid_nonce(nonce) {
         return Err("lazer 進度紀錄的工作階段無效".into());
     }
     let mut latest = None;
     // Immutable milestones are seven exact paths, never paths from payloads.
     for stage in ProgressStage::ALL {
-        if read_progress_file(&paths.progress(nonce, stage), nonce, stage)?
+        if read_progress_file(&paths.progress(nonce, stage), nonce, stage, endpoint)?
             == ProgressRead::Complete
         {
             latest = Some(stage);
@@ -1535,21 +1664,21 @@ fn progress_temporary_paths(paths: &Paths, nonce: &str) -> Result<Vec<(PathBuf, 
     Ok(files)
 }
 
-fn cleanup_progress(paths: &Paths, nonce: &str) -> Result<()> {
+fn cleanup_progress(paths: &Paths, nonce: &str, endpoint: &Endpoint) -> Result<()> {
     if !valid_nonce(nonce) {
         return Err("lazer 進度清理的工作階段無效".into());
     }
     let mut files = Vec::new();
     for stage in ProgressStage::ALL {
         let path = paths.progress(nonce, stage);
-        match read_progress_file(&path, nonce, stage)? {
+        match read_progress_file(&path, nonce, stage, endpoint)? {
             ProgressRead::Complete => files.push(path),
             ProgressRead::Publishing => return Err("lazer 進度紀錄尚未關閉；現有檔案已保留".into()),
             ProgressRead::Absent => {}
         }
     }
     for (path, stage) in progress_temporary_paths(paths, nonce)? {
-        match read_progress_file(&path, nonce, stage)? {
+        match read_progress_file(&path, nonce, stage, endpoint)? {
             ProgressRead::Complete => files.push(path),
             ProgressRead::Publishing => {
                 return Err("lazer 進度暫存紀錄尚未關閉；現有檔案已保留".into())
@@ -1566,23 +1695,35 @@ fn cleanup_progress(paths: &Paths, nonce: &str) -> Result<()> {
     Ok(())
 }
 
-fn read_failure(paths: &Paths, nonce: &str) -> Result<Option<Failure>> {
+fn read_failure(
+    paths: &Paths,
+    nonce: &str,
+    endpoint: &Endpoint,
+    allow_legacy: bool,
+) -> Result<Option<Failure>> {
     if !valid_nonce(nonce) {
         return Err("lazer 失敗紀錄的工作階段無效".into());
     }
     let failure = read_json_limit(&paths.failure(nonce), MAX_FAILURE_BYTES)
         .map_err(|_| "lazer 失敗紀錄無效；不會接受啟動結果，現有檔案已保留")?;
     if let Some(failure) = &failure {
-        validate_failure(failure, nonce)?;
+        validate_failure(failure, nonce, endpoint, allow_legacy)?;
     }
     Ok(failure)
 }
 
-fn validate_failure(failure: &Failure, nonce: &str) -> Result<()> {
+fn validate_failure(
+    failure: &Failure,
+    nonce: &str,
+    endpoint: &Endpoint,
+    allow_legacy: bool,
+) -> Result<()> {
     let code_allowed = match failure.stage.as_str() {
         "bootstrap" => matches!(
             failure.code.as_str(),
             "bootstrap_failed"
+                | "server_endpoint_missing"
+                | "server_endpoint_invalid"
                 | "session_missing"
                 | "install_root_missing"
                 | "data_root_missing"
@@ -1657,12 +1798,24 @@ fn validate_failure(failure: &Failure, nonce: &str) -> Result<()> {
                 | "Exception"
         )
     };
+    let endpoint_allowed = match &failure.endpoint {
+        FailureEndpoint::Selected(origin) => origin == endpoint.as_str(),
+        FailureEndpoint::Unavailable => {
+            failure.stage == "bootstrap"
+                && matches!(
+                    failure.code.as_str(),
+                    "server_endpoint_missing" | "server_endpoint_invalid"
+                )
+        }
+        FailureEndpoint::LegacyMissing => allow_legacy && endpoint == &Endpoint::default(),
+    };
     if !valid_nonce(nonce)
         || failure.protocol != 1
         || failure.session != nonce
         || failure.fixture
         || !code_allowed
         || !exception_allowed
+        || !endpoint_allowed
     {
         return Err("lazer 失敗紀錄不符合正式工作階段契約；現有檔案已保留".into());
     }
@@ -1670,19 +1823,18 @@ fn validate_failure(failure: &Failure, nonce: &str) -> Result<()> {
 }
 
 fn cleanup_failure(paths: &Paths, nonce: &str) -> Result<()> {
-    if let Some(failure) = read_failure(paths, nonce)? {
-        if let Some(session) = read_session(paths)? {
-            merge_failure(session.failure, Some(failure))?;
-        }
+    let session = matching_session(paths, nonce)?;
+    if let Some(failure) = read_failure(paths, nonce, session.endpoint(), session.version < 3)? {
+        merge_failure(session.failure, Some(failure))?;
         let path = paths.failure(nonce);
         ordinary_file(&path)?;
         fs::remove_file(path).map_err(|_| "無法移除工作階段失敗訊號")?;
     }
     Ok(())
 }
-fn cleanup_ready(paths: &Paths, nonce: &str) -> Result<()> {
+fn cleanup_ready(paths: &Paths, nonce: &str, endpoint: &Endpoint) -> Result<()> {
     if let Some(ready) = read_ready(paths, nonce)? {
-        validate_ready(&ready, nonce)?;
+        validate_ready(&ready, nonce, endpoint)?;
         let path = paths.ready(nonce);
         ordinary_file(&path)?;
         fs::remove_file(path).map_err(|_| "無法移除工作階段啟動訊號")?;
@@ -1692,13 +1844,13 @@ fn cleanup_ready(paths: &Paths, nonce: &str) -> Result<()> {
 
 fn cleanup_session_ready(paths: &Paths, session: &Session) -> Result<()> {
     if !session.legacy_ready {
-        return cleanup_ready(paths, &session.nonce);
+        return cleanup_ready(paths, &session.nonce, session.endpoint());
     }
     let path = paths
         .legacy_data
         .join(format!("session-ready-{}.json", session.nonce));
     if let Some(ready) = read_json::<Ready>(&path)? {
-        validate_ready(&ready, &session.nonce)?;
+        validate_ready(&ready, &session.nonce, session.endpoint())?;
         ordinary_file(&path)?;
         fs::remove_file(path).map_err(|_| "無法移除舊版工作階段啟動訊號")?;
     }
@@ -2118,9 +2270,10 @@ mod tests {
         }
         fn session(&self, paths: &Paths) -> Session {
             Session {
-                version: 2,
+                version: 3,
                 nonce: fresh_nonce().unwrap(),
                 client: Client::Lazer,
+                endpoint: Some(Endpoint::default()),
                 selected_executable: self.client.clone(),
                 selected_identity: "fixture-selected-id".into(),
                 launcher_executable: paths.launcher.clone(),
@@ -2163,7 +2316,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_contract_has_exact_public_fields_and_no_server_selector() {
+    fn snapshot_contract_has_exact_public_fields_and_active_endpoint() {
         let fixture = Fixture::new();
         let snapshot = snapshot_at(&fixture.paths).unwrap();
         assert_eq!(
@@ -2171,7 +2324,7 @@ mod tests {
             json!({
                 "stable":{"path":null,"running":false},
                 "lazer":{"path":null,"running":false,"compatibility":"unknown"},
-                "phase":"idle","detail":"選擇遊戲安裝路徑以連線至 Illyaverse","pluginPresent":false
+                "phase":"idle","detail":"選擇遊戲安裝路徑以連線至 Illyaverse","pluginPresent":false,"activeEndpoint":null
             })
         );
         assert_eq!(
@@ -2185,6 +2338,142 @@ mod tests {
                 .is_err()
         );
         assert!(handle_internal(&["help".into()]).is_none());
+    }
+
+    #[test]
+    fn endpoint_setting_changes_only_next_launch_and_invalid_input_preserves_records() {
+        let fixture = Fixture::new();
+        assert_eq!(settings_at(&fixture.paths).unwrap().endpoint, SERVER);
+        let first = save_endpoint_at(&fixture.paths, "HTTPS://First.Example:443/").unwrap();
+        assert_eq!(first.endpoint, "https://first.example");
+        let mut session = fixture.session(&fixture.paths);
+        session.endpoint = Some(read_preferences(&fixture.paths).unwrap().endpoint);
+        write_json(&fixture.paths.session(), &session).unwrap();
+        let before_session = fs::read(fixture.paths.session()).unwrap();
+        let next = save_endpoint_at(&fixture.paths, "https://next.example:8443").unwrap();
+        assert_eq!(next.endpoint, "https://next.example:8443");
+        assert_eq!(fs::read(fixture.paths.session()).unwrap(), before_session);
+        assert_eq!(
+            snapshot_at(&fixture.paths)
+                .unwrap()
+                .active_endpoint
+                .as_deref(),
+            Some("https://first.example")
+        );
+        let before_preferences = fs::read(fixture.paths.prefs()).unwrap();
+        let error =
+            save_endpoint_at(&fixture.paths, "https://name:fixture-password@ppy.sh").unwrap_err();
+        assert!(!error.contains("fixture-password"));
+        assert_eq!(fs::read(fixture.paths.prefs()).unwrap(), before_preferences);
+        assert_eq!(fs::read(fixture.paths.session()).unwrap(), before_session);
+    }
+
+    #[test]
+    fn historical_sessions_default_only_to_original_endpoint_and_v3_requires_one() {
+        let fixture = Fixture::new();
+        write_json(&fixture.paths.prefs(), &json!({"stable":null,"lazer":null})).unwrap();
+        assert_eq!(
+            read_preferences(&fixture.paths).unwrap().endpoint,
+            Endpoint::default()
+        );
+        let mut value = serde_json::to_value(fixture.session(&fixture.paths)).unwrap();
+        value.as_object_mut().unwrap().remove("endpoint");
+        write_json(&fixture.paths.session(), &value).unwrap();
+        assert!(read_session(&fixture.paths).is_err());
+        value["version"] = json!(2);
+        write_json(&fixture.paths.session(), &value).unwrap();
+        let historical = read_session(&fixture.paths).unwrap().unwrap();
+        assert_eq!(historical.endpoint(), &Endpoint::default());
+        value["endpoint"] = json!("https://another.example");
+        write_json(&fixture.paths.session(), &value).unwrap();
+        assert!(read_session(&fixture.paths).is_err());
+        value["version"] = json!(3);
+        write_json(&fixture.paths.session(), &value).unwrap();
+        assert_eq!(
+            read_session(&fixture.paths)
+                .unwrap()
+                .unwrap()
+                .endpoint()
+                .as_str(),
+            "https://another.example"
+        );
+    }
+
+    #[test]
+    fn stable_custom_port_refuses_before_any_session_or_process_action() {
+        let fixture = Fixture::new();
+        let preferences = Preferences {
+            stable: Some(fixture.client.clone()),
+            lazer: None,
+            endpoint: Endpoint::parse("https://selected.example:8443").unwrap(),
+        };
+        write_json(&fixture.paths.prefs(), &preferences).unwrap();
+        let before = fs::read(fixture.paths.prefs()).unwrap();
+        assert!(start_session(&fixture.paths, Client::Stable)
+            .unwrap_err()
+            .contains("HTTPS port 443"));
+        assert!(!fixture.paths.session().exists());
+        assert_eq!(fs::read(fixture.paths.prefs()).unwrap(), before);
+    }
+
+    #[test]
+    fn ready_and_first_draw_are_bound_to_captured_endpoint_including_port() {
+        let fixture = Fixture::new();
+        let nonce = fresh_nonce().unwrap();
+        let endpoint = Endpoint::parse("https://selected.example:8443").unwrap();
+        let ready = json!({"protocol":1,"session":nonce,"status":"ready","endpoint":endpoint.as_str(),"fixture":false});
+        write_json(&fixture.paths.ready(&nonce), &ready).unwrap();
+        let signal = read_ready(&fixture.paths, &nonce).unwrap().unwrap();
+        validate_ready(&signal, &nonce, &endpoint).unwrap();
+        assert!(validate_ready(&signal, &nonce, &Endpoint::default()).is_err());
+        assert!(cleanup_ready(&fixture.paths, &nonce, &Endpoint::default()).is_err());
+        assert!(fixture.paths.ready(&nonce).exists());
+        let stage = ProgressStage::FirstSuccessfulDraw;
+        let mut progress = progress_signal(&nonce, stage);
+        progress.endpoint = endpoint.as_str().to_owned();
+        write_json(&fixture.paths.progress(&nonce, stage), &progress).unwrap();
+        assert_eq!(
+            read_progress(&fixture.paths, &nonce, &endpoint).unwrap(),
+            Some(stage)
+        );
+        for wrong in [
+            Endpoint::default(),
+            Endpoint::parse("https://selected.example").unwrap(),
+        ] {
+            assert!(read_progress(&fixture.paths, &nonce, &wrong).is_err());
+            assert!(cleanup_progress(&fixture.paths, &nonce, &wrong).is_err());
+        }
+        assert!(fixture.paths.progress(&nonce, stage).exists());
+        cleanup_ready(&fixture.paths, &nonce, &endpoint).unwrap();
+        cleanup_progress(&fixture.paths, &nonce, &endpoint).unwrap();
+    }
+
+    #[test]
+    fn failure_endpoint_requires_match_or_only_typed_unavailable_bootstrap() {
+        let nonce = fresh_nonce().unwrap();
+        let endpoint = Endpoint::parse("https://selected.example:8443").unwrap();
+        let mut failure = managed_failure(&nonce);
+        failure.endpoint = FailureEndpoint::Selected(endpoint.as_str().to_owned());
+        validate_failure(&failure, &nonce, &endpoint, false).unwrap();
+        assert!(validate_failure(&failure, &nonce, &Endpoint::default(), false).is_err());
+        failure.endpoint = FailureEndpoint::Unavailable;
+        assert!(validate_failure(&failure, &nonce, &endpoint, false).is_err());
+        failure.stage = "bootstrap".into();
+        for code in ["server_endpoint_missing", "server_endpoint_invalid"] {
+            failure.code = code.into();
+            validate_failure(&failure, &nonce, &endpoint, false).unwrap();
+        }
+        let mut value = serde_json::to_value(&failure).unwrap();
+        assert!(value["endpoint"].is_null());
+        value.as_object_mut().unwrap().remove("endpoint");
+        let missing: Failure = serde_json::from_value(value).unwrap();
+        assert!(validate_failure(&missing, &nonce, &endpoint, false).is_err());
+        let mut old = serde_json::to_value(managed_failure(&nonce)).unwrap();
+        old.as_object_mut().unwrap().remove("endpoint");
+        let old: Failure = serde_json::from_value(old).unwrap();
+        validate_failure(&old, &nonce, &Endpoint::default(), true).unwrap();
+        assert!(validate_failure(&old, &nonce, &Endpoint::default(), false).is_err());
+        assert!(validate_failure(&old, &nonce, &endpoint, true).is_err());
     }
 
     #[test]
@@ -2264,6 +2553,7 @@ mod tests {
             stage: "assemblies".into(),
             code: "client_assembly_location_mismatch".into(),
             exception: "TransfigurationStartupException".into(),
+            endpoint: FailureEndpoint::Selected(SERVER.into()),
             fixture: false,
         }
     }
@@ -2349,7 +2639,10 @@ mod tests {
         let path = fixture.paths.progress(&nonce, stage);
         let normal = serde_json::to_value(progress_signal(&nonce, stage)).unwrap();
         write_json(&path, &normal).unwrap();
-        assert_eq!(read_progress(&fixture.paths, &nonce).unwrap(), Some(stage));
+        assert_eq!(
+            read_progress(&fixture.paths, &nonce, &Endpoint::default()).unwrap(),
+            Some(stage)
+        );
         for (field, value) in [
             ("protocol", json!(2)),
             ("session", json!("0".repeat(64))),
@@ -2365,10 +2658,10 @@ mod tests {
             let mut wrong = normal.clone();
             wrong[field] = value;
             write_json(&path, &wrong).unwrap();
-            let error = read_progress(&fixture.paths, &nonce).unwrap_err();
+            let error = read_progress(&fixture.paths, &nonce, &Endpoint::default()).unwrap_err();
             assert!(!error.contains("fixture-secret"));
             assert!(!error.contains("fixture-token"));
-            assert!(cleanup_progress(&fixture.paths, &nonce).is_err());
+            assert!(cleanup_progress(&fixture.paths, &nonce, &Endpoint::default()).is_err());
             assert!(path.exists());
         }
         let duplicate = format!(
@@ -2378,11 +2671,11 @@ mod tests {
                 .trim_start_matches('{')
         );
         fs::write(&path, duplicate).unwrap();
-        assert!(read_progress(&fixture.paths, &nonce).is_err());
+        assert!(read_progress(&fixture.paths, &nonce, &Endpoint::default()).is_err());
         fs::write(&path, vec![b' '; MAX_PROGRESS_BYTES as usize + 1]).unwrap();
-        assert!(read_progress(&fixture.paths, &nonce).is_err());
-        assert!(read_progress(&fixture.paths, "../../foreign").is_err());
-        assert!(cleanup_progress(&fixture.paths, "../../foreign").is_err());
+        assert!(read_progress(&fixture.paths, &nonce, &Endpoint::default()).is_err());
+        assert!(read_progress(&fixture.paths, "../../foreign", &Endpoint::default()).is_err());
+        assert!(cleanup_progress(&fixture.paths, "../../foreign", &Endpoint::default()).is_err());
     }
 
     #[test]
@@ -2427,8 +2720,8 @@ mod tests {
         )
         .unwrap();
         managed.cleanup().unwrap();
-        cleanup_ready(&fixture.paths, &session.nonce).unwrap();
-        cleanup_progress(&fixture.paths, &session.nonce).unwrap();
+        cleanup_ready(&fixture.paths, &session.nonce, &Endpoint::default()).unwrap();
+        cleanup_progress(&fixture.paths, &session.nonce, &Endpoint::default()).unwrap();
         update_session(&fixture.paths, &session.nonce, |record| {
             record.install_session = None
         })
@@ -2444,7 +2737,10 @@ mod tests {
             .detail
             .contains("last_progress=renderer_initializing"));
         assert!(!receipt.installed_path.exists());
-        assert_eq!(read_progress(&fixture.paths, &session.nonce).unwrap(), None);
+        assert_eq!(
+            read_progress(&fixture.paths, &session.nonce, &Endpoint::default()).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -2518,7 +2814,7 @@ mod tests {
             &mut result,
         )
         .unwrap();
-        cleanup_progress(&fixture.paths, &session.nonce).unwrap();
+        cleanup_progress(&fixture.paths, &session.nonce, &Endpoint::default()).unwrap();
         let record = matching_session(&fixture.paths, &session.nonce).unwrap();
         assert_eq!(record.phase, Phase::Error);
         assert_eq!(
@@ -2528,7 +2824,10 @@ mod tests {
         assert!(result
             .unwrap_err()
             .contains("last_progress=first_successful_draw"));
-        assert_eq!(read_progress(&fixture.paths, &session.nonce).unwrap(), None);
+        assert_eq!(
+            read_progress(&fixture.paths, &session.nonce, &Endpoint::default()).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -2555,7 +2854,7 @@ mod tests {
             &mut result,
         )
         .unwrap();
-        cleanup_progress(&fixture.paths, &session.nonce).unwrap();
+        cleanup_progress(&fixture.paths, &session.nonce, &Endpoint::default()).unwrap();
         assert!(result.is_ok());
         let record = matching_session(&fixture.paths, &session.nonce).unwrap();
         assert_eq!(
@@ -2586,12 +2885,15 @@ mod tests {
             "b".repeat(32)
         ));
         fs::write(&foreign, b"unrelated staging fixture").unwrap();
-        assert_eq!(read_progress(&fixture.paths, &nonce).unwrap(), Some(stage));
-        assert!(cleanup_progress(&fixture.paths, &nonce).is_err());
+        assert_eq!(
+            read_progress(&fixture.paths, &nonce, &Endpoint::default()).unwrap(),
+            Some(stage)
+        );
+        assert!(cleanup_progress(&fixture.paths, &nonce, &Endpoint::default()).is_err());
         assert!(final_path.exists());
         assert_eq!(fs::read(&temporary).unwrap(), b"{partial owned fixture");
         write_json(&temporary, &progress_signal(&nonce, stage)).unwrap();
-        cleanup_progress(&fixture.paths, &nonce).unwrap();
+        cleanup_progress(&fixture.paths, &nonce, &Endpoint::default()).unwrap();
         assert!(!temporary.exists());
         assert!(!final_path.exists());
         assert_eq!(fs::read(foreign).unwrap(), b"unrelated staging fixture");
@@ -2610,7 +2912,8 @@ mod tests {
             "a".repeat(32)
         ));
         fs::write(&temporary, b"{partial owned fixture").unwrap();
-        let error = cleanup_progress(&fixture.paths, &session.nonce).unwrap_err();
+        let error =
+            cleanup_progress(&fixture.paths, &session.nonce, &Endpoint::default()).unwrap_err();
         session.phase = Phase::CleanupFailed;
         session.detail = retained_cleanup_detail(error, &session);
         write_json(&fixture.paths.session(), &session).unwrap();
@@ -2650,21 +2953,27 @@ mod tests {
             .open(&final_path)
             .unwrap();
         assert_eq!(
-            read_progress_file(&final_path, &nonce, ProgressStage::FirstSuccessfulDraw).unwrap(),
+            read_progress_file(
+                &final_path,
+                &nonce,
+                ProgressStage::FirstSuccessfulDraw,
+                &Endpoint::default()
+            )
+            .unwrap(),
             ProgressRead::Publishing
         );
         assert_eq!(
-            read_progress(&fixture.paths, &nonce).unwrap(),
+            read_progress(&fixture.paths, &nonce, &Endpoint::default()).unwrap(),
             Some(ProgressStage::RendererInitialized)
         );
-        assert!(cleanup_progress(&fixture.paths, &nonce).is_err());
+        assert!(cleanup_progress(&fixture.paths, &nonce, &Endpoint::default()).is_err());
         assert!(previous.exists());
         drop(held);
         assert_eq!(
-            read_progress(&fixture.paths, &nonce).unwrap(),
+            read_progress(&fixture.paths, &nonce, &Endpoint::default()).unwrap(),
             Some(ProgressStage::FirstSuccessfulDraw)
         );
-        cleanup_progress(&fixture.paths, &nonce).unwrap();
+        cleanup_progress(&fixture.paths, &nonce, &Endpoint::default()).unwrap();
         assert!(!final_path.exists());
     }
 
@@ -2685,8 +2994,8 @@ mod tests {
             return;
         }
         let before = fs::read(&target).unwrap();
-        assert!(read_progress(&fixture.paths, &nonce).is_err());
-        assert!(cleanup_progress(&fixture.paths, &nonce).is_err());
+        assert!(read_progress(&fixture.paths, &nonce, &Endpoint::default()).is_err());
+        assert!(cleanup_progress(&fixture.paths, &nonce, &Endpoint::default()).is_err());
         fs::remove_file(&path).unwrap();
         let temporary = fixture.paths.control.join(format!(
             "session-progress-{nonce}-{}-{}.tmp",
@@ -2697,7 +3006,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, &temporary).unwrap();
         #[cfg(windows)]
         std::os::windows::fs::symlink_file(&target, &temporary).unwrap();
-        assert!(cleanup_progress(&fixture.paths, &nonce).is_err());
+        assert!(cleanup_progress(&fixture.paths, &nonce, &Endpoint::default()).is_err());
         assert_eq!(fs::read(target).unwrap(), before);
     }
 
@@ -2708,7 +3017,9 @@ mod tests {
         let normal = serde_json::to_value(managed_failure(&nonce)).unwrap();
         let file = fixture.paths.failure(&nonce);
         write_json(&file, &normal).unwrap();
-        let accepted = read_failure(&fixture.paths, &nonce).unwrap().unwrap();
+        let accepted = read_failure(&fixture.paths, &nonce, &Endpoint::default(), false)
+            .unwrap()
+            .unwrap();
         assert!(
             failure_detail(&accepted, None, Some(2)).contains("client_assembly_location_mismatch")
         );
@@ -2726,7 +3037,8 @@ mod tests {
             let mut wrong = normal.clone();
             wrong[field] = value;
             write_json(&file, &wrong).unwrap();
-            let error = read_failure(&fixture.paths, &nonce).unwrap_err();
+            let error =
+                read_failure(&fixture.paths, &nonce, &Endpoint::default(), false).unwrap_err();
             assert!(!error.contains("fixture-secret"));
             assert!(!error.contains("fixture-token"));
             assert!(!error.contains("private.ini"));
@@ -2740,10 +3052,12 @@ mod tests {
                 .trim_start_matches('{')
         );
         fs::write(&file, duplicate).unwrap();
-        assert!(read_failure(&fixture.paths, &nonce).is_err());
+        assert!(read_failure(&fixture.paths, &nonce, &Endpoint::default(), false).is_err());
         fs::write(&file, vec![b' '; MAX_FAILURE_BYTES as usize + 1]).unwrap();
-        assert!(read_failure(&fixture.paths, &nonce).is_err());
-        assert!(read_failure(&fixture.paths, "../../outside").is_err());
+        assert!(read_failure(&fixture.paths, &nonce, &Endpoint::default(), false).is_err());
+        assert!(
+            read_failure(&fixture.paths, "../../outside", &Endpoint::default(), false).is_err()
+        );
         assert!(read_ready(&fixture.paths, "../../outside").is_err());
     }
 
@@ -2817,7 +3131,11 @@ mod tests {
         write_json(&fixture.paths.session(), &session).unwrap();
         let sidecar = fixture.paths.failure(&session.nonce);
         fs::write(&sidecar, b"{\"protocol\":").unwrap();
-        let mut result = Err(read_failure(&fixture.paths, &session.nonce).unwrap_err());
+        let mut result =
+            Err(
+                read_failure(&fixture.paths, &session.nonce, &Endpoint::default(), false)
+                    .unwrap_err(),
+            );
         write_json(&sidecar, &managed_failure(&session.nonce)).unwrap();
         capture_closed_child(
             &fixture.paths,
@@ -2939,7 +3257,7 @@ mod tests {
             eprintln!("SKIPPED failure symlink fixture: missing Windows symlink privilege");
             return;
         }
-        assert!(read_failure(&fixture.paths, &nonce).is_err());
+        assert!(read_failure(&fixture.paths, &nonce, &Endpoint::default(), false).is_err());
         assert!(cleanup_failure(&fixture.paths, &nonce).is_err());
         assert_eq!(fs::read(target).unwrap(), before);
     }
@@ -2951,7 +3269,7 @@ mod tests {
         assert_ne!(nonce, fresh_nonce().unwrap());
         let normal = json!({"protocol":1,"session":nonce,"status":"ready","endpoint":SERVER,"fixture":false});
         let signal: Ready = serde_json::from_value(normal.clone()).unwrap();
-        validate_ready(&signal, &nonce).unwrap();
+        validate_ready(&signal, &nonce, &Endpoint::default()).unwrap();
         for (key, value) in [
             ("fixture", json!(true)),
             ("protocol", json!(2)),
@@ -2961,7 +3279,12 @@ mod tests {
         ] {
             let mut wrong = normal.clone();
             wrong[key] = value;
-            assert!(validate_ready(&serde_json::from_value(wrong).unwrap(), &nonce).is_err());
+            assert!(validate_ready(
+                &serde_json::from_value(wrong).unwrap(),
+                &nonce,
+                &Endpoint::default()
+            )
+            .is_err());
         }
         let mut unknown = normal;
         unknown["extra"] = json!(true);
@@ -3087,6 +3410,7 @@ mod tests {
             &Preferences {
                 stable: None,
                 lazer: Some(fixture.client.clone()),
+                endpoint: Endpoint::default(),
             },
         )
         .unwrap();
@@ -3338,6 +3662,7 @@ mod tests {
             &Preferences {
                 stable: None,
                 lazer: Some(fixture.client.clone()),
+                endpoint: Endpoint::default(),
             },
         )
         .unwrap();

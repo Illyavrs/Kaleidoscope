@@ -5,8 +5,10 @@ use kaleidoscope::{
 use std::path::PathBuf;
 
 const HELP: &str = "Kaleidoscope — Illyaverse connection assistant\n\n\
-Fixed Illyaverse launcher:\n\
+Illyaverse launcher:\n\
   kaleidoscope launcher status\n\
+  kaleidoscope launcher settings\n\
+  kaleidoscope launcher set-endpoint HTTPS_ORIGIN (next launch)\n\
   kaleidoscope launcher set-client stable|lazer PATH\n\
   kaleidoscope launcher start stable|lazer\n\
   kaleidoscope launcher start stable|lazer PATH (select and start)\n\
@@ -236,6 +238,23 @@ fn main() {
 
 fn launcher_command(values: &[String]) -> Result<()> {
     use kaleidoscope::launcher::runtime::{self, Client};
+    let settings = match values
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        ["settings"] => Some(runtime::launcher_settings()?),
+        ["set-endpoint", endpoint] => Some(runtime::launcher_set_endpoint(endpoint)?),
+        _ => None,
+    };
+    if let Some(settings) = settings {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&settings).map_err(|error| error.to_string())?
+        );
+        return Ok(());
+    }
     let client = |value: &str| match value {
         "stable" => Ok(Client::Stable),
         "lazer" => Ok(Client::Lazer),
@@ -259,7 +278,7 @@ fn launcher_command(values: &[String]) -> Result<()> {
         }
         ["stop"] => runtime::stop()?,
         ["recover"] => runtime::recover()?,
-        _ => return Err("Run kaleidoscope --help for fixed launcher commands".into()),
+        _ => return Err("Run kaleidoscope --help for launcher commands".into()),
     };
     println!(
         "{}",
@@ -359,6 +378,7 @@ mod tests {
             phase: Phase::Preparing,
             detail: "fixed diagnostic".into(),
             plugin_present: false,
+            active_endpoint: None,
         };
         for phase in [
             Phase::Preparing,
