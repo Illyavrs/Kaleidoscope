@@ -31,6 +31,7 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const CLI_START_TIMEOUT: Duration = Duration::from_secs(40);
 const MAX_FAILURE_BYTES: u64 = 2048;
+const MAX_PROGRESS_BYTES: u64 = 2048;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -168,6 +169,54 @@ struct Session {
     host_status: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     child_exit: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_progress: Option<ProgressStage>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ProgressStage {
+    OriginalMainEntered,
+    GameHostCreated,
+    GameHostRunEntered,
+    RendererInitializing,
+    WindowCreated,
+    RendererInitialized,
+    FirstSuccessfulDraw,
+}
+
+impl ProgressStage {
+    const ALL: [Self; 7] = [
+        Self::OriginalMainEntered,
+        Self::GameHostCreated,
+        Self::GameHostRunEntered,
+        Self::RendererInitializing,
+        Self::WindowCreated,
+        Self::RendererInitialized,
+        Self::FirstSuccessfulDraw,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::OriginalMainEntered => "original_main_entered",
+            Self::GameHostCreated => "game_host_created",
+            Self::GameHostRunEntered => "game_host_run_entered",
+            Self::RendererInitializing => "renderer_initializing",
+            Self::RendererInitialized => "renderer_initialized",
+            Self::WindowCreated => "window_created",
+            Self::FirstSuccessfulDraw => "first_successful_draw",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Progress {
+    protocol: u8,
+    session: String,
+    stage: ProgressStage,
+    endpoint: String,
+    fixture: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -235,6 +284,10 @@ impl Paths {
     }
     fn failure(&self, nonce: &str) -> PathBuf {
         self.control.join(format!("session-failure-{nonce}.json"))
+    }
+    fn progress(&self, nonce: &str, stage: ProgressStage) -> PathBuf {
+        self.control
+            .join(format!("session-progress-{nonce}-{}.json", stage.name()))
     }
     fn bridge(&self) -> Result<PathBuf> {
         bridge_at_launcher(&self.launcher)
@@ -317,6 +370,9 @@ fn wait_for_start(mut read: impl FnMut() -> Result<Session>, timeout: Duration) 
             _ => {}
         }
         if Instant::now() >= deadline {
+            if session.client == Client::Lazer {
+                return Err("CLI 啟動確認逾時；lazer 尚未確認首個遊戲畫面，工作階段會繼續等待。請執行 launcher status 查看狀態".into());
+            }
             return Err(
                 "CLI 啟動確認逾時；尚未確認遊戲安全啟動。請執行 launcher status 查看工作階段"
                     .into(),
@@ -384,6 +440,7 @@ fn start_session(paths: &Paths, client: Client) -> Result<String> {
         failure: None,
         host_status: None,
         child_exit: None,
+        last_progress: None,
     };
     write_json(&paths.session(), &session)?;
     let mut command = Command::new(&paths.launcher);
@@ -630,6 +687,7 @@ fn recover_at(paths: &Paths) -> Result<()> {
     if let Some(mut session) = session {
         cleanup_session_ready(paths, &session)?;
         cleanup_failure(paths, &session.nonce)?;
+        cleanup_progress(paths, &session.nonce)?;
         session.phase = Phase::Idle;
         session.detail = "已關閉遊戲並移除 Illyaverse 連線模組".into();
         session.guardian = None;
@@ -640,6 +698,7 @@ fn recover_at(paths: &Paths) -> Result<()> {
         session.failure = None;
         session.host_status = None;
         session.child_exit = None;
+        session.last_progress = None;
         write_json(&paths.session(), &session)?;
     }
     Ok(())
@@ -701,7 +760,8 @@ fn run_guardian(paths: &Paths, nonce: &str) -> Result<i32> {
         None => Ok(()),
     }
     .and_then(|()| cleanup_ready(paths, nonce))
-    .and_then(|()| cleanup_failure(paths, nonce));
+    .and_then(|()| cleanup_failure(paths, nonce))
+    .and_then(|()| cleanup_progress(paths, nonce));
     let _lock = ControlLock::open(paths)?;
     let mut current = matching_session(paths, nonce)?;
     current.guardian = None;
@@ -714,18 +774,20 @@ fn run_guardian(paths: &Paths, nonce: &str) -> Result<i32> {
             } else {
                 Phase::Error
             };
-            current.detail = result
-                .as_ref()
-                .err()
-                .cloned()
-                .unwrap_or_else(|| "已關閉遊戲並移除 Illyaverse 連線模組".into());
+            current.detail = result.as_ref().err().cloned().unwrap_or_else(|| {
+                with_progress(
+                    "已關閉遊戲並移除 Illyaverse 連線模組".into(),
+                    current.last_progress,
+                )
+            });
         }
         Err(error) => {
             current.phase = Phase::CleanupFailed;
-            current.detail = match &result {
+            let detail = match &result {
                 Err(failure) => format!("{failure}；清理失敗：{error}"),
                 Ok(()) => error,
             };
+            current.detail = retained_cleanup_detail(detail, &current);
         }
     }
     write_json(&paths.session(), &current)?;
@@ -814,7 +876,8 @@ fn run_client(
         })?;
     }
     let ready_deadline = Instant::now() + READY_TIMEOUT;
-    let mut ready = session.client == Client::Stable;
+    let mut guard_verified = session.client == Client::Stable;
+    let mut started = session.client == Client::Stable;
     loop {
         let status = child
             .as_mut()
@@ -822,10 +885,10 @@ fn run_client(
             .try_wait()
             .map_err(|_| "無法查詢遊戲狀態")?;
         if let Some(status) = status {
-            return finish_child_exit(paths, session, ready, status.success(), status.code());
+            return finish_child_exit(paths, session, started, status.success(), status.code());
         }
         let record = matching_session(paths, &session.nonce)?;
-        if session.client == Client::Lazer && !ready {
+        if session.client == Client::Lazer && !started {
             if let Some(failure) = read_failure(paths, &session.nonce)? {
                 let detail = failure_detail(&failure, record.host_status, None);
                 update_session(paths, &session.nonce, |record| {
@@ -833,20 +896,29 @@ fn run_client(
                 })?;
                 return Err(detail);
             }
-            if let Some(signal) = read_ready(paths, &session.nonce)? {
-                validate_ready(&signal, &session.nonce)?;
-                if record.child.as_ref().map(process::state).transpose()?
-                    != Some(process::State::Live)
-                {
-                    return Err("安全啟動訊號缺少有效的遊戲程序身分".into());
+            if !guard_verified {
+                if let Some(signal) = read_ready(paths, &session.nonce)? {
+                    validate_ready(&signal, &session.nonce)?;
+                    if record.child.as_ref().map(process::state).transpose()?
+                        != Some(process::State::Live)
+                    {
+                        return Err("安全啟動訊號缺少有效的遊戲程序身分".into());
+                    }
+                    guard_verified = true;
+                } else if Instant::now() >= ready_deadline {
+                    return Err("未收到安全啟動確認；關閉遊戲後才會清理連線模組".into());
                 }
-                ready = true;
-                update_session(paths, &session.nonce, |record| {
-                    record.phase = Phase::Running;
-                    record.detail = "lazer 安全啟動驗證完成，已使用 Illyaverse 私服設定".into();
-                })?;
-            } else if Instant::now() >= ready_deadline {
-                return Err("未收到安全啟動確認；關閉遊戲後才會清理連線模組".into());
+            }
+            let progress = read_progress(paths, &session.nonce)?;
+            let child_state = record.child.as_ref().map(process::state).transpose()?;
+            let _lock = ControlLock::open(paths)?;
+            let mut current = matching_session(paths, &session.nonce)?;
+            let previous = (current.phase, current.detail.clone(), current.last_progress);
+            started = apply_lazer_progress(&mut current, guard_verified, progress, child_state)?;
+            if (current.phase, &current.detail, current.last_progress)
+                != (previous.0, &previous.1, previous.2)
+            {
+                write_json(&paths.session(), &current)?;
             }
         }
         if record.stop_requested {
@@ -860,6 +932,67 @@ fn run_client(
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn apply_lazer_progress(
+    session: &mut Session,
+    guard_verified: bool,
+    progress: Option<ProgressStage>,
+    child_state: Option<process::State>,
+) -> Result<bool> {
+    session.last_progress = session.last_progress.max(progress);
+    let first_draw = session.last_progress == Some(ProgressStage::FirstSuccessfulDraw);
+    if guard_verified
+        && first_draw
+        && (session.child.is_none() || child_state != Some(process::State::Live))
+    {
+        return Err("首個畫面訊號缺少有效的遊戲程序身分；不會接受啟動結果".into());
+    }
+    let started = guard_verified
+        && first_draw
+        && session.child.is_some()
+        && child_state == Some(process::State::Live);
+    if !session.stop_requested && session.phase == Phase::Preparing {
+        if started {
+            session.phase = Phase::Running;
+            session.detail = with_progress(
+                "lazer 首個畫面已繪製，已使用 Illyaverse 私服設定".into(),
+                session.last_progress,
+            );
+        } else if guard_verified {
+            session.detail = with_progress(
+                "lazer 啟動防護驗證完成；正在等待首個遊戲畫面".into(),
+                session.last_progress,
+            );
+        } else if session.last_progress.is_some() {
+            session.detail =
+                with_progress("正在等待 lazer 啟動防護驗證".into(), session.last_progress);
+        }
+    }
+    Ok(started && !session.stop_requested)
+}
+
+fn with_progress(mut detail: String, progress: Option<ProgressStage>) -> String {
+    for stage in ProgressStage::ALL {
+        detail = detail.replace(&format!(" last_progress={}", stage.name()), "");
+    }
+    if let Some(stage) = progress {
+        detail.push_str(" last_progress=");
+        detail.push_str(stage.name());
+    }
+    detail
+}
+
+fn retained_cleanup_detail(mut detail: String, session: &Session) -> String {
+    if session.client == Client::Lazer {
+        detail = with_progress(detail, session.last_progress);
+        if let Some(exit) = session.child_exit {
+            if !detail.contains(" child_exit=") {
+                detail.push_str(&format!(" child_exit={exit}"));
+            }
+        }
+    }
+    detail
 }
 
 fn finish_child_exit(
@@ -876,15 +1009,21 @@ fn finish_child_exit(
     } else {
         None
     };
+    let progress = if session.client == Client::Lazer {
+        read_progress(paths, &session.nonce)?
+    } else {
+        None
+    };
     let _lock = ControlLock::open(paths)?;
     let mut record = matching_session(paths, &session.nonce)?;
     record.child_exit = exit_code;
     record.failure = merge_failure(record.failure, failure)?;
+    record.last_progress = record.last_progress.max(progress);
     let detail = if let Some(failure) = &record.failure {
         Some(failure_detail(failure, record.host_status, exit_code))
     } else if !ready || !success {
         let code = if !ready {
-            "child_exit_before_readiness"
+            "child_exit_before_first_draw_verification"
         } else {
             "child_exit_failed"
         };
@@ -895,6 +1034,7 @@ fn finish_child_exit(
     } else {
         None
     };
+    let detail = detail.map(|detail| with_progress(detail, record.last_progress));
     if let Some(detail) = &detail {
         record.phase = Phase::Error;
         record.detail = detail.clone();
@@ -935,6 +1075,18 @@ fn capture_closed_child(
     } else {
         None
     };
+    let progress = if client == Client::Lazer {
+        match read_progress(paths, nonce) {
+            Ok(progress) => progress,
+            Err(error) => {
+                *result = Err(error);
+                rejected = true;
+                None
+            }
+        }
+    } else {
+        None
+    };
     let _lock = ControlLock::open(paths)?;
     let mut record = matching_session(paths, nonce)?;
     match merge_failure(record.failure.clone(), observed) {
@@ -945,10 +1097,20 @@ fn capture_closed_child(
         }
     }
     record.child_exit = exit;
+    record.last_progress = record.last_progress.max(progress);
     if rejected {
         record.detail = result.as_ref().unwrap_err().clone();
     } else if let Some(failure) = &record.failure {
         let detail = failure_detail(failure, record.host_status, exit);
+        record.detail = detail.clone();
+        *result = Err(detail);
+    }
+    if let Err(detail) = result {
+        let mut detail = detail.clone();
+        if !detail.contains(" child_exit=") {
+            detail.push_str(&format!(" child_exit={}", exit_detail(exit)));
+        }
+        detail = with_progress(detail, record.last_progress);
         record.detail = detail.clone();
         *result = Err(detail);
     }
@@ -1016,6 +1178,14 @@ fn run_lazer_host(paths: &Paths, nonce: &str) -> Result<i32> {
         validate_child_environment(paths, nonce, install, library)?;
         if path_exists(&paths.failure(nonce))? {
             return Err("lazer 工作階段已有失敗訊號；不會進入 Main".into());
+        }
+        for stage in ProgressStage::ALL {
+            if path_exists(&paths.progress(nonce, stage))? {
+                return Err("lazer 工作階段已有進度訊號；不會進入 Main".into());
+            }
+        }
+        if !progress_temporary_paths(paths, nonce)?.is_empty() {
+            return Err("lazer 工作階段已有進度暫存訊號；不會進入 Main".into());
         }
         let (_, hash) = verify_bridge(paths)?;
         let bridge = library.rulesets().join(RULESET_FILENAME);
@@ -1220,6 +1390,9 @@ fn read_session(paths: &Paths) -> Result<Option<Session>> {
                 return Err("lazer 失敗紀錄不得屬於另一種遊戲工作階段".into());
             }
         }
+        if session.last_progress.is_some() && session.client != Client::Lazer {
+            return Err("lazer 進度紀錄不得屬於另一種遊戲工作階段".into());
+        }
         if session.host_status.is_some()
             && session
                 .failure
@@ -1247,6 +1420,148 @@ fn validate_ready(signal: &Ready, nonce: &str) -> Result<()> {
         || signal.fixture
     {
         return Err("lazer 安全啟動訊號不符合正式私服契約".into());
+    }
+    Ok(())
+}
+
+fn validate_progress(signal: &Progress, nonce: &str, stage: ProgressStage) -> Result<()> {
+    if !valid_nonce(nonce)
+        || signal.protocol != 1
+        || signal.session != nonce
+        || signal.stage != stage
+        || signal.endpoint != SERVER
+        || signal.fixture
+    {
+        return Err("lazer 進度訊號不符合正式工作階段契約；現有檔案已保留".into());
+    }
+    Ok(())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ProgressRead {
+    Absent,
+    Publishing,
+    Complete,
+}
+
+fn progress_io_pending(error: &std::io::Error) -> bool {
+    cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33))
+}
+
+fn read_progress_file(path: &Path, nonce: &str, stage: ProgressStage) -> Result<ProgressRead> {
+    if !valid_nonce(nonce) {
+        return Err("lazer 進度紀錄的工作階段無效".into());
+    }
+    let invalid = "lazer 進度紀錄無效；不會接受啟動結果，現有檔案已保留";
+    check_components(path.parent().ok_or(invalid)?)?;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ProgressRead::Absent)
+        }
+        Err(error) if progress_io_pending(&error) => return Ok(ProgressRead::Publishing),
+        Err(_) => return Err(invalid.into()),
+    };
+    check_metadata(&metadata)?;
+    if !metadata.is_file() {
+        return Err(invalid.into());
+    }
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if progress_io_pending(&error) => return Ok(ProgressRead::Publishing),
+        Err(_) => return Err(invalid.into()),
+    };
+    let mut bytes = Vec::new();
+    file.take(MAX_PROGRESS_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| invalid)?;
+    if bytes.len() as u64 > MAX_PROGRESS_BYTES {
+        return Err(invalid.into());
+    }
+    let signal: Progress = serde_json::from_slice(&bytes).map_err(|_| invalid)?;
+    validate_progress(&signal, nonce, stage)?;
+    Ok(ProgressRead::Complete)
+}
+
+fn read_progress(paths: &Paths, nonce: &str) -> Result<Option<ProgressStage>> {
+    if !valid_nonce(nonce) {
+        return Err("lazer 進度紀錄的工作階段無效".into());
+    }
+    let mut latest = None;
+    // Immutable milestones are seven exact paths, never paths from payloads.
+    for stage in ProgressStage::ALL {
+        if read_progress_file(&paths.progress(nonce, stage), nonce, stage)?
+            == ProgressRead::Complete
+        {
+            latest = Some(stage);
+        }
+    }
+    Ok(latest)
+}
+
+fn progress_temporary_paths(paths: &Paths, nonce: &str) -> Result<Vec<(PathBuf, ProgressStage)>> {
+    if !valid_nonce(nonce) {
+        return Err("lazer 進度暫存紀錄的工作階段無效".into());
+    }
+    check_components(&paths.control)?;
+    let prefix = format!("session-progress-{nonce}-");
+    let mut files = Vec::new();
+    for entry in fs::read_dir(&paths.control).map_err(|_| "無法檢查工作階段進度暫存紀錄")?
+    {
+        let entry = entry.map_err(|_| "無法檢查工作階段進度暫存紀錄")?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(suffix) = name
+            .strip_prefix(&prefix)
+            .and_then(|name| name.strip_suffix(".tmp"))
+        else {
+            continue;
+        };
+        let candidate = ProgressStage::ALL.into_iter().find_map(|stage| {
+            suffix
+                .strip_prefix(stage.name())
+                .and_then(|suffix| suffix.strip_prefix('-'))
+                .filter(|random| {
+                    random.len() == 32
+                        && random
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+                .map(|_| stage)
+        });
+        let stage = candidate.ok_or("lazer 進度暫存檔名無效；現有檔案已保留")?;
+        files.push((paths.control.join(name), stage));
+    }
+    Ok(files)
+}
+
+fn cleanup_progress(paths: &Paths, nonce: &str) -> Result<()> {
+    if !valid_nonce(nonce) {
+        return Err("lazer 進度清理的工作階段無效".into());
+    }
+    let mut files = Vec::new();
+    for stage in ProgressStage::ALL {
+        let path = paths.progress(nonce, stage);
+        match read_progress_file(&path, nonce, stage)? {
+            ProgressRead::Complete => files.push(path),
+            ProgressRead::Publishing => return Err("lazer 進度紀錄尚未關閉；現有檔案已保留".into()),
+            ProgressRead::Absent => {}
+        }
+    }
+    for (path, stage) in progress_temporary_paths(paths, nonce)? {
+        match read_progress_file(&path, nonce, stage)? {
+            ProgressRead::Complete => files.push(path),
+            ProgressRead::Publishing => {
+                return Err("lazer 進度暫存紀錄尚未關閉；現有檔案已保留".into())
+            }
+            ProgressRead::Absent => {}
+        }
+    }
+    // Validate all candidate evidence before deleting any one of these files.
+    // A partial, foreign or linked file remains available for inspection.
+    for path in files {
+        ordinary_file(&path)?;
+        fs::remove_file(path).map_err(|_| "無法移除工作階段進度訊號")?;
     }
     Ok(())
 }
@@ -1300,6 +1615,7 @@ fn validate_failure(failure: &Failure, nonce: &str) -> Result<()> {
                 | "ruleset_api_incompatible"
                 | "endpoint_contract_incompatible"
                 | "endpoint_factory_incompatible"
+                | "startup_progress_contract_incompatible"
         ),
         "network_guards" => failure.code == "network_guard_install_failed",
         "client_guards" => failure.code == "client_guard_install_failed",
@@ -1820,6 +2136,7 @@ mod tests {
                 failure: None,
                 host_status: None,
                 child_exit: None,
+                last_progress: None,
             }
         }
     }
@@ -1951,6 +2268,439 @@ mod tests {
         }
     }
 
+    fn progress_signal(nonce: &str, stage: ProgressStage) -> Progress {
+        Progress {
+            protocol: 1,
+            session: nonce.into(),
+            stage,
+            endpoint: SERVER.into(),
+            fixture: false,
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn lazer_guard_and_intermediate_progress_wait_for_verified_first_draw() {
+        let fixture = Fixture::new();
+        let paths = fixture.live_paths();
+        let own = process::current_identity().unwrap();
+        let mut session = fixture.session(&paths);
+        session.launcher_identity = own.executable_identity.clone();
+        session.child = Some(own.clone());
+        let live = Some(process::state(&own).unwrap());
+        assert!(!apply_lazer_progress(&mut session, true, None, live).unwrap());
+        assert_eq!(session.phase, Phase::Preparing);
+        assert!(session.detail.contains("正在等待首個遊戲畫面"));
+        for stage in ProgressStage::ALL
+            .into_iter()
+            .filter(|stage| *stage != ProgressStage::FirstSuccessfulDraw)
+        {
+            assert!(!apply_lazer_progress(&mut session, true, Some(stage), live).unwrap());
+            assert_eq!(session.phase, Phase::Preparing);
+            assert_eq!(session.last_progress, Some(stage));
+        }
+        let mut unguarded = session.clone();
+        assert!(!apply_lazer_progress(
+            &mut unguarded,
+            false,
+            Some(ProgressStage::FirstSuccessfulDraw),
+            live
+        )
+        .unwrap());
+        assert_eq!(unguarded.phase, Phase::Preparing);
+        for state in [
+            None,
+            Some(process::State::Gone),
+            Some(process::State::Ambiguous),
+        ] {
+            let mut closed = session.clone();
+            assert!(apply_lazer_progress(
+                &mut closed,
+                true,
+                Some(ProgressStage::FirstSuccessfulDraw),
+                state
+            )
+            .is_err());
+            assert_eq!(closed.phase, Phase::Preparing);
+        }
+        assert!(apply_lazer_progress(
+            &mut session,
+            true,
+            Some(ProgressStage::FirstSuccessfulDraw),
+            live
+        )
+        .unwrap());
+        assert_eq!(session.phase, Phase::Running);
+        assert!(session
+            .detail
+            .contains("last_progress=first_successful_draw"));
+        write_json(&paths.session(), &session).unwrap();
+        assert_eq!(
+            matching_session(&paths, &session.nonce).unwrap().phase,
+            Phase::Running
+        );
+    }
+
+    #[test]
+    fn progress_reader_requires_exact_schema_nonce_stage_and_fixed_endpoint() {
+        let fixture = Fixture::new();
+        let nonce = fresh_nonce().unwrap();
+        let stage = ProgressStage::RendererInitializing;
+        let path = fixture.paths.progress(&nonce, stage);
+        let normal = serde_json::to_value(progress_signal(&nonce, stage)).unwrap();
+        write_json(&path, &normal).unwrap();
+        assert_eq!(read_progress(&fixture.paths, &nonce).unwrap(), Some(stage));
+        for (field, value) in [
+            ("protocol", json!(2)),
+            ("session", json!("0".repeat(64))),
+            ("stage", json!("first_successful_draw")),
+            ("stage", json!("private_path=fixture-secret")),
+            ("endpoint", json!("https://osu.ppy.sh")),
+            ("fixture", json!(true)),
+            (
+                "message",
+                json!("password=fixture-secret&token=fixture-token"),
+            ),
+        ] {
+            let mut wrong = normal.clone();
+            wrong[field] = value;
+            write_json(&path, &wrong).unwrap();
+            let error = read_progress(&fixture.paths, &nonce).unwrap_err();
+            assert!(!error.contains("fixture-secret"));
+            assert!(!error.contains("fixture-token"));
+            assert!(cleanup_progress(&fixture.paths, &nonce).is_err());
+            assert!(path.exists());
+        }
+        let duplicate = format!(
+            "{{\"protocol\":1,{}",
+            serde_json::to_string(&normal)
+                .unwrap()
+                .trim_start_matches('{')
+        );
+        fs::write(&path, duplicate).unwrap();
+        assert!(read_progress(&fixture.paths, &nonce).is_err());
+        fs::write(&path, vec![b' '; MAX_PROGRESS_BYTES as usize + 1]).unwrap();
+        assert!(read_progress(&fixture.paths, &nonce).is_err());
+        assert!(read_progress(&fixture.paths, "../../foreign").is_err());
+        assert!(cleanup_progress(&fixture.paths, "../../foreign").is_err());
+    }
+
+    #[test]
+    fn native_crash_keeps_last_verified_progress_after_owned_cleanup() {
+        let fixture = Fixture::new();
+        let mut session = fixture.session(&fixture.paths);
+        let library = session.library.as_ref().unwrap();
+        ensure_directory(&library.rulesets()).unwrap();
+        let (bridge, hash) = fixture.bridge();
+        let mut managed = ManagedRuleset::open(library.rulesets()).unwrap();
+        let receipt = managed.install(bridge, &hash).unwrap();
+        session.install_session = Some(receipt.session_id);
+        write_json(&fixture.paths.session(), &session).unwrap();
+        for stage in [
+            ProgressStage::OriginalMainEntered,
+            ProgressStage::RendererInitializing,
+        ] {
+            write_json(
+                &fixture.paths.progress(&session.nonce, stage),
+                &progress_signal(&session.nonce, stage),
+            )
+            .unwrap();
+        }
+        let ready = json!({"protocol":1,"session":session.nonce,"status":"ready","endpoint":SERVER,"fixture":false});
+        write_json(&fixture.paths.ready(&session.nonce), &ready).unwrap();
+        let mut result =
+            finish_child_exit(&fixture.paths, &session, false, false, Some(-1073741819));
+        assert!(result
+            .as_ref()
+            .unwrap_err()
+            .contains("last_progress=renderer_initializing"));
+        assert!(result
+            .as_ref()
+            .unwrap_err()
+            .contains("child_exit=-1073741819"));
+        capture_closed_child(
+            &fixture.paths,
+            &session.nonce,
+            Client::Lazer,
+            Some(-1073741819),
+            &mut result,
+        )
+        .unwrap();
+        managed.cleanup().unwrap();
+        cleanup_ready(&fixture.paths, &session.nonce).unwrap();
+        cleanup_progress(&fixture.paths, &session.nonce).unwrap();
+        update_session(&fixture.paths, &session.nonce, |record| {
+            record.install_session = None
+        })
+        .unwrap();
+        let record = matching_session(&fixture.paths, &session.nonce).unwrap();
+        assert_eq!(record.phase, Phase::Error);
+        assert_eq!(
+            record.last_progress,
+            Some(ProgressStage::RendererInitializing)
+        );
+        assert_eq!(record.child_exit, Some(-1073741819));
+        assert!(record
+            .detail
+            .contains("last_progress=renderer_initializing"));
+        assert!(!receipt.installed_path.exists());
+        assert_eq!(read_progress(&fixture.paths, &session.nonce).unwrap(), None);
+    }
+
+    #[test]
+    fn guard_without_draw_cli_timeout_leaves_process_record_and_artifact_untouched() {
+        let fixture = Fixture::new();
+        let mut session = fixture.session(&fixture.paths);
+        let library = session.library.as_ref().unwrap();
+        ensure_directory(&library.rulesets()).unwrap();
+        let (bridge, hash) = fixture.bridge();
+        let mut managed = ManagedRuleset::open(library.rulesets()).unwrap();
+        let receipt = managed.install(bridge, &hash).unwrap();
+        session.install_session = Some(receipt.session_id);
+        session.child = Some(process::Identity {
+            pid: 42,
+            creation_time: 1,
+            executable: session.launcher_executable.clone(),
+            executable_identity: session.launcher_identity.clone(),
+        });
+        assert!(!apply_lazer_progress(
+            &mut session,
+            true,
+            Some(ProgressStage::GameHostCreated),
+            Some(process::State::Live)
+        )
+        .unwrap());
+        write_json(&fixture.paths.session(), &session).unwrap();
+        let before = fs::read(fixture.paths.session()).unwrap();
+        assert!(wait_for_start(
+            || matching_session(&fixture.paths, &session.nonce),
+            Duration::ZERO
+        )
+        .unwrap_err()
+        .contains("逾時"));
+        assert_eq!(fs::read(fixture.paths.session()).unwrap(), before);
+        assert_eq!(
+            fs::read(&receipt.installed_path).unwrap(),
+            b"owned startup bridge fixture"
+        );
+        assert!(
+            !matching_session(&fixture.paths, &session.nonce)
+                .unwrap()
+                .stop_requested
+        );
+    }
+
+    #[test]
+    fn post_exit_progress_is_captured_without_promoting_running() {
+        let fixture = Fixture::new();
+        let session = fixture.session(&fixture.paths);
+        write_json(&fixture.paths.session(), &session).unwrap();
+        write_json(
+            &fixture
+                .paths
+                .progress(&session.nonce, ProgressStage::OriginalMainEntered),
+            &progress_signal(&session.nonce, ProgressStage::OriginalMainEntered),
+        )
+        .unwrap();
+        let mut result = finish_child_exit(&fixture.paths, &session, false, true, Some(0));
+        write_json(
+            &fixture
+                .paths
+                .progress(&session.nonce, ProgressStage::FirstSuccessfulDraw),
+            &progress_signal(&session.nonce, ProgressStage::FirstSuccessfulDraw),
+        )
+        .unwrap();
+        capture_closed_child(
+            &fixture.paths,
+            &session.nonce,
+            Client::Lazer,
+            Some(0),
+            &mut result,
+        )
+        .unwrap();
+        cleanup_progress(&fixture.paths, &session.nonce).unwrap();
+        let record = matching_session(&fixture.paths, &session.nonce).unwrap();
+        assert_eq!(record.phase, Phase::Error);
+        assert_eq!(
+            record.last_progress,
+            Some(ProgressStage::FirstSuccessfulDraw)
+        );
+        assert!(result
+            .unwrap_err()
+            .contains("last_progress=first_successful_draw"));
+        assert_eq!(read_progress(&fixture.paths, &session.nonce).unwrap(), None);
+    }
+
+    #[test]
+    fn post_draw_normal_exit_retains_progress_without_an_error() {
+        let fixture = Fixture::new();
+        let mut session = fixture.session(&fixture.paths);
+        session.phase = Phase::Running;
+        session.last_progress = Some(ProgressStage::FirstSuccessfulDraw);
+        write_json(&fixture.paths.session(), &session).unwrap();
+        let sidecar = fixture
+            .paths
+            .progress(&session.nonce, ProgressStage::FirstSuccessfulDraw);
+        write_json(
+            &sidecar,
+            &progress_signal(&session.nonce, ProgressStage::FirstSuccessfulDraw),
+        )
+        .unwrap();
+        let mut result = finish_child_exit(&fixture.paths, &session, true, true, Some(0));
+        capture_closed_child(
+            &fixture.paths,
+            &session.nonce,
+            Client::Lazer,
+            Some(0),
+            &mut result,
+        )
+        .unwrap();
+        cleanup_progress(&fixture.paths, &session.nonce).unwrap();
+        assert!(result.is_ok());
+        let record = matching_session(&fixture.paths, &session.nonce).unwrap();
+        assert_eq!(
+            record.last_progress,
+            Some(ProgressStage::FirstSuccessfulDraw)
+        );
+        assert_eq!(record.child_exit, Some(0));
+        assert!(!sidecar.exists());
+    }
+
+    #[test]
+    fn progress_staging_cleanup_validates_all_before_deleting_and_preserves_other_sessions() {
+        let fixture = Fixture::new();
+        let nonce = fresh_nonce().unwrap();
+        let stage = ProgressStage::OriginalMainEntered;
+        let final_path = fixture.paths.progress(&nonce, stage);
+        write_json(&final_path, &progress_signal(&nonce, stage)).unwrap();
+        let temporary = fixture.paths.control.join(format!(
+            "session-progress-{nonce}-{}-{}.tmp",
+            stage.name(),
+            "a".repeat(32)
+        ));
+        fs::write(&temporary, b"{partial owned fixture").unwrap();
+        let other_nonce = fresh_nonce().unwrap();
+        let foreign = fixture.paths.control.join(format!(
+            "session-progress-{other_nonce}-{}-{}.tmp",
+            stage.name(),
+            "b".repeat(32)
+        ));
+        fs::write(&foreign, b"unrelated staging fixture").unwrap();
+        assert_eq!(read_progress(&fixture.paths, &nonce).unwrap(), Some(stage));
+        assert!(cleanup_progress(&fixture.paths, &nonce).is_err());
+        assert!(final_path.exists());
+        assert_eq!(fs::read(&temporary).unwrap(), b"{partial owned fixture");
+        write_json(&temporary, &progress_signal(&nonce, stage)).unwrap();
+        cleanup_progress(&fixture.paths, &nonce).unwrap();
+        assert!(!temporary.exists());
+        assert!(!final_path.exists());
+        assert_eq!(fs::read(foreign).unwrap(), b"unrelated staging fixture");
+    }
+
+    #[test]
+    fn cleanup_failure_after_zero_exit_retains_first_draw_and_numeric_exit_detail() {
+        let fixture = Fixture::new();
+        let mut session = fixture.session(&fixture.paths);
+        session.last_progress = Some(ProgressStage::FirstSuccessfulDraw);
+        session.child_exit = Some(0);
+        let temporary = fixture.paths.control.join(format!(
+            "session-progress-{}-{}-{}.tmp",
+            session.nonce,
+            ProgressStage::FirstSuccessfulDraw.name(),
+            "a".repeat(32)
+        ));
+        fs::write(&temporary, b"{partial owned fixture").unwrap();
+        let error = cleanup_progress(&fixture.paths, &session.nonce).unwrap_err();
+        session.phase = Phase::CleanupFailed;
+        session.detail = retained_cleanup_detail(error, &session);
+        write_json(&fixture.paths.session(), &session).unwrap();
+        let record = matching_session(&fixture.paths, &session.nonce).unwrap();
+        assert!(record
+            .detail
+            .contains("last_progress=first_successful_draw"));
+        assert!(record.detail.contains("child_exit=0"));
+        assert_eq!(fs::read(temporary).unwrap(), b"{partial owned fixture");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn progress_sharing_during_atomic_publication_is_pending_but_cleanup_refuses_it() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let fixture = Fixture::new();
+        let nonce = fresh_nonce().unwrap();
+        let previous = fixture
+            .paths
+            .progress(&nonce, ProgressStage::RendererInitialized);
+        write_json(
+            &previous,
+            &progress_signal(&nonce, ProgressStage::RendererInitialized),
+        )
+        .unwrap();
+        let final_path = fixture
+            .paths
+            .progress(&nonce, ProgressStage::FirstSuccessfulDraw);
+        write_json(
+            &final_path,
+            &progress_signal(&nonce, ProgressStage::FirstSuccessfulDraw),
+        )
+        .unwrap();
+        let held = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&final_path)
+            .unwrap();
+        assert_eq!(
+            read_progress_file(&final_path, &nonce, ProgressStage::FirstSuccessfulDraw).unwrap(),
+            ProgressRead::Publishing
+        );
+        assert_eq!(
+            read_progress(&fixture.paths, &nonce).unwrap(),
+            Some(ProgressStage::RendererInitialized)
+        );
+        assert!(cleanup_progress(&fixture.paths, &nonce).is_err());
+        assert!(previous.exists());
+        drop(held);
+        assert_eq!(
+            read_progress(&fixture.paths, &nonce).unwrap(),
+            Some(ProgressStage::FirstSuccessfulDraw)
+        );
+        cleanup_progress(&fixture.paths, &nonce).unwrap();
+        assert!(!final_path.exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn linked_progress_final_and_temp_records_are_never_accepted_or_deleted() {
+        let fixture = Fixture::new();
+        let nonce = fresh_nonce().unwrap();
+        let stage = ProgressStage::FirstSuccessfulDraw;
+        let target = fixture.directory.join("foreign-progress.json");
+        write_json(&target, &progress_signal(&nonce, stage)).unwrap();
+        let path = fixture.paths.progress(&nonce, stage);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_file(&target, &path).is_err() {
+            eprintln!("SKIPPED progress symlink fixture: missing Windows symlink privilege");
+            return;
+        }
+        let before = fs::read(&target).unwrap();
+        assert!(read_progress(&fixture.paths, &nonce).is_err());
+        assert!(cleanup_progress(&fixture.paths, &nonce).is_err());
+        fs::remove_file(&path).unwrap();
+        let temporary = fixture.paths.control.join(format!(
+            "session-progress-{nonce}-{}-{}.tmp",
+            stage.name(),
+            "a".repeat(32)
+        ));
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &temporary).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&target, &temporary).unwrap();
+        assert!(cleanup_progress(&fixture.paths, &nonce).is_err());
+        assert_eq!(fs::read(target).unwrap(), before);
+    }
+
     #[test]
     fn failure_reader_is_strict_bounded_and_never_exposes_raw_diagnostics() {
         let fixture = Fixture::new();
@@ -2003,7 +2753,7 @@ mod tests {
         let session = fixture.session(&fixture.paths);
         write_json(&fixture.paths.session(), &session).unwrap();
         let error = finish_child_exit(&fixture.paths, &session, false, true, Some(0)).unwrap_err();
-        assert!(error.contains("child_exit_before_readiness"));
+        assert!(error.contains("child_exit_before_first_draw_verification"));
         assert!(error.contains("child_exit=0"));
         assert_eq!(
             matching_session(&fixture.paths, &session.nonce)

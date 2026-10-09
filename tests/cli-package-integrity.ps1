@@ -37,6 +37,80 @@ function Read-FixtureJson([string]$Path) {
     }
     return $value
 }
+if (!('Illyaverse.Kaleidoscope.VersionResourceProbe' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+namespace Illyaverse.Kaleidoscope {
+    public static class VersionResourceProbe {
+        [DllImport("version.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint GetFileVersionInfoSizeW(string filename, out uint handle);
+        [DllImport("version.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool GetFileVersionInfoW(string filename, uint handle, uint size, IntPtr data);
+        [DllImport("version.dll", CharSet = CharSet.Unicode)]
+        private static extern bool VerQueryValueW(IntPtr block, string query, out IntPtr value, out uint length);
+
+        private static void RequireRange(IntPtr block, uint size, IntPtr value, uint length) {
+            long offset = value.ToInt64() - block.ToInt64();
+            if (offset < 0 || offset > size || length > size - offset)
+                throw new InvalidOperationException("Invalid bounded VERSIONINFO query.");
+        }
+        private static string Version(uint high, uint low) {
+            return (high >> 16) + "." + (high & 65535) + "." + (low >> 16) + "." + (low & 65535);
+        }
+        public static Dictionary<string, string> Read(string filename) {
+            uint ignored;
+            uint size = GetFileVersionInfoSizeW(filename, out ignored);
+            if (size == 0 || size > 1048576)
+                throw new InvalidOperationException("Missing or oversized Windows VERSIONINFO resource.");
+            IntPtr block = Marshal.AllocHGlobal((int)size);
+            try {
+                if (!GetFileVersionInfoW(filename, 0, size, block))
+                    throw new InvalidOperationException("Cannot read Windows VERSIONINFO resource.");
+                IntPtr value; uint length;
+                if (!VerQueryValueW(block, @"\", out value, out length) || length < 52)
+                    throw new InvalidOperationException("Missing fixed Windows VERSIONINFO root.");
+                RequireRange(block, size, value, 52);
+                if (unchecked((uint)Marshal.ReadInt32(value)) != 0xFEEF04BD)
+                    throw new InvalidOperationException("Invalid fixed Windows VERSIONINFO signature.");
+                var fields = new Dictionary<string, string>(StringComparer.Ordinal);
+                fields["FixedFileVersion"] = Version(unchecked((uint)Marshal.ReadInt32(value, 8)), unchecked((uint)Marshal.ReadInt32(value, 12)));
+                fields["FixedProductVersion"] = Version(unchecked((uint)Marshal.ReadInt32(value, 16)), unchecked((uint)Marshal.ReadInt32(value, 20)));
+                fields["FixedFileOS"] = unchecked((uint)Marshal.ReadInt32(value, 32)).ToString();
+                fields["FixedFileType"] = unchecked((uint)Marshal.ReadInt32(value, 36)).ToString();
+                if (!VerQueryValueW(block, @"\VarFileInfo\Translation", out value, out length) || length == 0 || length > 256 || length % 4 != 0)
+                    throw new InvalidOperationException("Missing bounded Windows VERSIONINFO translation.");
+                RequireRange(block, size, value, length);
+                IntPtr translations = value;
+                uint translationBytes = length;
+                foreach (string key in new[] { "ProductName", "FileDescription", "InternalName", "OriginalFilename", "FileVersion", "ProductVersion" }) {
+                    for (int offset = 0; offset < translationBytes; offset += 4) {
+                        ushort language = unchecked((ushort)Marshal.ReadInt16(translations, offset));
+                        ushort codepage = unchecked((ushort)Marshal.ReadInt16(translations, offset + 2));
+                        string query = @"\StringFileInfo\" + language.ToString("x4") + codepage.ToString("x4") + @"\" + key;
+                        if (!VerQueryValueW(block, query, out value, out length) || length == 0 || length > 512)
+                            throw new InvalidOperationException("Missing bounded Kaleidoscope VERSIONINFO field.");
+                        RequireRange(block, size, value, length * 2);
+                        string text = Marshal.PtrToStringUni(value, (int)length).TrimEnd('\0');
+                        string prior;
+                        if (fields.TryGetValue(key, out prior) && prior != text)
+                            throw new InvalidOperationException("Conflicting Kaleidoscope VERSIONINFO translations.");
+                        fields[key] = text;
+                    }
+                }
+                return fields;
+            } finally { Marshal.FreeHGlobal(block); }
+        }
+    }
+}
+'@
+}
+function Read-KaleidoscopeVersionResource([string]$Path) {
+    $checked = Assert-PackageWorkspacePath $Path $repo
+    return [Illyaverse.Kaleidoscope.VersionResourceProbe]::Read($checked)
+}
 function Get-ByteInventory([string]$Directory) {
     $records = [ordered]@{}
     foreach ($item in Get-ChildItem -LiteralPath $Directory -File -Recurse -Force) {
@@ -62,6 +136,23 @@ try {
     Assert-Check ((Read-FixtureJson $timestampFixture).completed_at_utc -ceq '2026-10-09T00:00:00.1234560Z') 'fixture mutation preserves all seven UTC timestamp digits'
     $null = Test-KaleidoscopeCliTestPackageArchive -ArchivePath ($package + '.zip') -Directory $package
     Assert-Check $true 'production CLI directory and ZIP match every payload byte'
+    $versionFields = Read-KaleidoscopeVersionResource (Join-Path $package 'Kaleidoscope.exe')
+    foreach ($field in @('FixedFileVersion', 'FixedProductVersion', 'FileVersion', 'ProductVersion')) {
+        Assert-Check ($versionFields[$field] -ceq '0.1.0.0') "CLI VERSIONINFO $field retains original launcher version"
+    }
+    foreach ($field in @('ProductName', 'FileDescription', 'InternalName', 'OriginalFilename')) {
+        $expected = switch ($field) {
+            'ProductName' { 'Kaleidoscope' }
+            'FileDescription' { 'Illyaverse launcher' }
+            'InternalName' { 'kaleidoscope' }
+            'OriginalFilename' { 'Kaleidoscope.exe' }
+        }
+        Assert-Check ($versionFields[$field] -ceq $expected) "CLI VERSIONINFO $field retains original launcher identity"
+    }
+    Assert-Check ($versionFields['FixedFileOS'] -ceq '262148' -and $versionFields['FixedFileType'] -ceq '1') 'CLI Win32 VERSIONINFO root is an NT Windows application'
+    $missingVersion = Join-Path $root 'missing-version.fixture.exe'
+    [IO.File]::WriteAllBytes($missingVersion, [Text.Encoding]::ASCII.GetBytes('MZ owned fixture without VERSIONINFO; never executed'))
+    Expect-Refusal 'Win32 version query refuses missing resource before reading a root pointer' { Read-KaleidoscopeVersionResource $missingVersion } '*Missing or oversized Windows VERSIONINFO resource*'
     $bindings = (& (Join-Path $package 'Kaleidoscope.exe') --inspect-package-bindings | Out-String) | ConvertFrom-Json -AsHashtable
     Assert-Check ($LASTEXITCODE -eq 0 -and $bindings.bridge_verified -eq $true -and $bindings.official_fallback -eq $false -and $bindings.shared_existing_library -eq $true) 'actual production-bound CLI diagnostic passes'
     $manifest = Read-FixtureJson (Join-Path $package 'package.json')
@@ -82,6 +173,8 @@ try {
     Expect-Refusal 'constructor refuses outside-workspace launcher before staging' { New-KaleidoscopeCliTestPackage @outsideArgs -OutputDirectory $outsideOutput } '*inside the repository workspace*'
     Assert-Check (!(Test-Path -LiteralPath $outsideOutput) -and !(Test-Path -LiteralPath $outside)) 'outside refusal produces no staged executable or outside file'
     $linkTarget = Copy-Fixture 'source-target'
+    $copiedVersion = Read-KaleidoscopeVersionResource (Join-Path $linkTarget 'Kaleidoscope.exe')
+    Assert-Check (@($versionFields.Keys | Where-Object { $copiedVersion[$_] -cne $versionFields[$_] }).Count -eq 0) 'fixture copy preserves every original CLI Win32 version field'
     $junction = Join-Path $root 'source-junction'
     $null = New-Item -ItemType Junction -Path $junction -Target $linkTarget
     try {
