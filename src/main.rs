@@ -9,8 +9,11 @@ Fixed Illyaverse launcher:\n\
   kaleidoscope launcher status\n\
   kaleidoscope launcher set-client stable|lazer PATH\n\
   kaleidoscope launcher start stable|lazer\n\
+  kaleidoscope launcher start stable|lazer PATH (select and start)\n\
   kaleidoscope launcher stop\n\
   kaleidoscope launcher recover\n\n\
+Package-only diagnostic (never launches a game):\n\
+  kaleidoscope --inspect-package-bindings\n\n\
 Developer hosts/profile tools:\n\
 Usage:\n\
   kaleidoscope inspect [--hosts PATH]\n\
@@ -194,6 +197,23 @@ fn run(args: Args) -> Result<()> {
 
 fn main() {
     let values: Vec<String> = std::env::args().skip(1).collect();
+    if values.first().map(String::as_str) == Some("--inspect-package-bindings") {
+        let result = if values.len() != 1 {
+            Err("--inspect-package-bindings does not accept options".to_owned())
+        } else {
+            kaleidoscope::launcher::runtime::inspect_package_bindings().and_then(|bindings| {
+                serde_json::to_string_pretty(&bindings).map_err(|error| error.to_string())
+            })
+        };
+        match result {
+            Ok(json) => println!("{json}"),
+            Err(error) => {
+                eprintln!("Kaleidoscope: {error}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
     if let Some(result) = kaleidoscope::launcher::runtime::handle_internal(&values) {
         match result {
             Ok(code) => std::process::exit(code),
@@ -232,6 +252,11 @@ fn launcher_command(values: &[String]) -> Result<()> {
             runtime::save_client_path(client(kind)?, std::path::Path::new(path))?
         }
         ["start", kind] => runtime::start(client(kind)?)?,
+        ["start", kind, path] => {
+            let kind = client(kind)?;
+            runtime::save_client_path(kind, std::path::Path::new(path))?;
+            runtime::start(kind)?
+        }
         ["stop"] => runtime::stop()?,
         ["recover"] => runtime::recover()?,
         _ => return Err("Run kaleidoscope --help for fixed launcher commands".into()),

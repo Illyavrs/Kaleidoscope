@@ -205,3 +205,19 @@ fn reviewed_snapshot_rejects_intervening_changes_before_a_write() {
         .status
         .success());
 }
+
+#[test]
+fn package_diagnostic_refuses_missing_bridge_and_extra_options_without_user_storage() {
+    let fixture = Fixture::new();
+    let executable = fixture.0.join("kaleidoscope.exe");
+    fs::copy(env!("CARGO_BIN_EXE_kaleidoscope"), &executable).unwrap();
+    for args in [
+        &["--inspect-package-bindings"][..],
+        &["--inspect-package-bindings", "--hosts", "forbidden"],
+    ] {
+        let output = Command::new(&executable).args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 1);
+    }
+}

@@ -31,6 +31,36 @@ cargo run -p kaleidoscope -- profile --client lazer --domain illya.example.com
 
 ## 本機測試 package
 
+目前新增一種明確標示為 `cli_connection_test` 的暫時命令列測試包。
+它使用普通 debug CLI build 與 production bridge，沒有 Tauri 視窗；完整 GUI
+release 套件仍需完成。這兩種套件的 verifier 與 metadata 分開，不能互相當成
+完成證據。從測試包目錄的 PowerShell 執行一個指令即可選擇並啟動已安裝的 lazer：
+
+```powershell
+.\Kaleidoscope.exe launcher start lazer "$env:LOCALAPPDATA\osulazer\current\osu!.exe"
+```
+
+自訂安裝可替換最後的 `osu!.exe` 路徑。支援的是 compatibility manifest 內精確
+hash 的 lazer `2026.1005.1`；未驗證版本會拒絕啟動。沿用原本圖譜庫，使用網站
+帳號登入私服。先前 `illya.test` 的本機 DNS／CA 設定仍需完成。關閉 lazer 後
+guardian 會清理自有 DLL；中斷後可執行 `.\Kaleidoscope.exe launcher recover`。
+遊戲／guardian 執行期間不要移動或刪除這個測試包。
+
+以下建置指令只讀取既有 production bridge，不開啟玩家遊戲、登入、圖譜庫、
+hosts 或 CA。`--inspect-package-bindings` 只讀取 EXE 所在套件中的 DLL，確認
+編譯時固定的 hash／endpoint／library 和登入隔離政策，不執行遊戲或背景 worker。
+
+```powershell
+pwsh -NoProfile -File tools/kaleidoscope/scripts/package-cli-test.ps1
+pwsh -NoProfile -File tools/kaleidoscope/scripts/verify-cli-test-package.ps1 -Directory <cli-package-directory>
+pwsh -NoProfile -File tools/kaleidoscope/scripts/verify-cli-test-package.ps1 -ArchivePath <cli-package.zip>
+pwsh -NoProfile -File tools/kaleidoscope/tests/cli-package-integrity.ps1 -PackageDirectory <cli-package-directory>
+```
+
+CLI 預設輸出到新的 `.artifacts/packages/kaleidoscope-cli-test-<時間>-<nonce>/`
+和同名 ZIP。manifest 明確保留 `native_gui_verified:false` 與
+`native_login_verified:false`；package tests 不能替代原生登入／送分／退出清理實測。
+
 `pwsh -File tools/kaleidoscope/scripts/package-launcher.ps1` 會驗證所選官方安裝、
 建置正式 bridge／介面／原生啟動器，再執行 `--verify-embedded-interface`。
 Rust 使用現有 repository `target/`，停用 incremental，完成後還原 process

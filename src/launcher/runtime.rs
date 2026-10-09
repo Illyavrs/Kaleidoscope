@@ -82,6 +82,44 @@ pub struct Snapshot {
     pub plugin_present: bool,
 }
 
+/// Package-only diagnostics. This command reads the launcher and its adjacent
+/// bridge, without resolving user storage, preferences or any game process.
+#[derive(Debug, Serialize)]
+pub struct PackageBindings {
+    pub protocol: u8,
+    pub artifact_kind: &'static str,
+    pub server: &'static str,
+    pub bridge_sha256: String,
+    pub bridge_verified: bool,
+    pub official_fallback: bool,
+    pub shared_existing_library: bool,
+    pub private_config_filename: &'static str,
+    pub supported_assemblies: std::collections::BTreeMap<&'static str, &'static str>,
+}
+
+pub fn inspect_package_bindings() -> Result<PackageBindings> {
+    let hash = option_env!("ILLYA_BRIDGE_SHA256")
+        .ok_or("此啟動器缺少正式連線模組發行雜湊，暫不支援 lazer")?;
+    let launcher = canonical_file(&std::env::current_exe().map_err(|error| error.to_string())?)?;
+    let bridge = bridge_at_launcher(&launcher)?;
+    verify_bridge_artifact(&bridge, hash)?;
+    Ok(PackageBindings {
+        protocol: 1,
+        artifact_kind: "cli_connection_test",
+        server: SERVER,
+        bridge_sha256: hash.to_owned(),
+        bridge_verified: true,
+        official_fallback: false,
+        shared_existing_library: true,
+        private_config_filename: "game.illyaverse.ini",
+        supported_assemblies: std::collections::BTreeMap::from([
+            ("osu.Game.dll", SUPPORTED_GAME_SHA256),
+            ("osu.Framework.dll", SUPPORTED_FRAMEWORK_SHA256),
+            ("osu!.dll", SUPPORTED_ENTRY_SHA256),
+        ]),
+    })
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Preferences {
@@ -177,12 +215,15 @@ impl Paths {
         self.control.join(format!("session-ready-{nonce}.json"))
     }
     fn bridge(&self) -> Result<PathBuf> {
-        Ok(self
-            .launcher
-            .parent()
-            .ok_or("啟動器缺少安裝資料夾")?
-            .join(RULESET_FILENAME))
+        bridge_at_launcher(&self.launcher)
     }
+}
+
+fn bridge_at_launcher(launcher: &Path) -> Result<PathBuf> {
+    Ok(launcher
+        .parent()
+        .ok_or("啟動器缺少安裝資料夾")?
+        .join(RULESET_FILENAME))
 }
 
 fn resolve_library(paths: &Paths, executable: &Path) -> Result<Library> {
@@ -981,14 +1022,18 @@ fn verify_bridge(paths: &Paths) -> Result<(PathBuf, String)> {
     verify_bridge_with_hash(paths, hash)
 }
 fn verify_bridge_with_hash(paths: &Paths, hash: &str) -> Result<(PathBuf, String)> {
+    let artifact = paths.bridge()?;
+    verify_bridge_artifact(&artifact, hash)?;
+    Ok((artifact, hash.to_owned()))
+}
+fn verify_bridge_artifact(artifact: &Path, hash: &str) -> Result<()> {
     if !valid_nonce(hash) {
         return Err("正式連線模組雜湊格式無效".into());
     }
-    let artifact = paths.bridge()?;
-    if artifact_sha256(&artifact)? != hash {
+    if artifact_sha256(artifact)? != hash {
         return Err("連線模組缺失或與正式發行雜湊不符".into());
     }
-    Ok((artifact, hash.to_owned()))
+    Ok(())
 }
 
 fn verify_lazer_compatibility(paths: &Paths, selected: &Path) -> Result<()> {

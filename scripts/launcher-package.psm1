@@ -172,9 +172,7 @@ function Test-KaleidoscopePackage {
     return Assert-PackageRecords (Get-PackageFileRecords $Directory) -AllowSyntheticFixtures:$AllowSyntheticFixtures
 }
 
-function Test-KaleidoscopePackageArchive {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$ArchivePath, [string]$Directory, [switch]$AllowSyntheticFixtures)
+function Get-PackageArchiveRecords([string]$ArchivePath) {
     $records = [ordered]@{}
     $zip = [IO.Compression.ZipFile]::OpenRead([IO.Path]::GetFullPath($ArchivePath))
     try {
@@ -196,6 +194,13 @@ function Test-KaleidoscopePackageArchive {
             }
         }
     } finally { $zip.Dispose() }
+    return $records
+}
+
+function Test-KaleidoscopePackageArchive {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ArchivePath, [string]$Directory, [switch]$AllowSyntheticFixtures)
+    $records = Get-PackageArchiveRecords $ArchivePath
     $package = Assert-PackageRecords $records -AllowSyntheticFixtures:$AllowSyntheticFixtures
     if ($Directory) {
         $files = Get-PackageFileRecords $Directory
@@ -203,6 +208,171 @@ function Test-KaleidoscopePackageArchive {
         foreach ($name in $script:allNames) { if ($records[$name].sha256 -ine $files[$name].sha256) { throw "ZIP does not match assembled package: $name" } }
     }
     return $package
+}
+
+function Assert-CliPackageBindings($Bindings, $Compatibility, [string]$BridgeHash) {
+    Assert-PackageKeys $Bindings @('protocol', 'artifact_kind', 'server', 'bridge_sha256', 'bridge_verified', 'official_fallback', 'shared_existing_library', 'private_config_filename', 'supported_assemblies') 'CLI package bindings'
+    Assert-PackageProtocol $Bindings.protocol 'CLI package bindings'
+    Assert-PackageLiteral $Bindings.artifact_kind 'cli_connection_test' 'CLI artifact_kind'
+    Assert-PackageLiteral $Bindings.server 'https://illya.test' 'CLI server'
+    Assert-PackageHash $Bindings.bridge_sha256 'CLI bridge_sha256'
+    if ($Bindings.bridge_sha256 -cne $BridgeHash) { throw 'Compiled CLI bridge hash does not match the production bridge.' }
+    Assert-PackageBoolean $Bindings.bridge_verified $true 'CLI bridge_verified'
+    Assert-PackageBoolean $Bindings.official_fallback $false 'CLI official_fallback'
+    Assert-PackageBoolean $Bindings.shared_existing_library $true 'CLI shared_existing_library'
+    Assert-PackageLiteral $Bindings.private_config_filename 'game.illyaverse.ini' 'CLI private configuration'
+    Assert-PackageKeys $Bindings.supported_assemblies @('osu.Game.dll', 'osu.Framework.dll', 'osu!.dll') 'CLI supported assemblies'
+    foreach ($name in $Bindings.supported_assemblies.Keys) {
+        Assert-PackageHash $Bindings.supported_assemblies[$name] "CLI assembly $name"
+        if ($Bindings.supported_assemblies[$name] -cne $Compatibility.assemblies[$name].sha256.ToLowerInvariant()) { throw "Compiled CLI assembly binding does not match compatibility: $name" }
+    }
+}
+
+function Assert-CliPackageRecords($Records) {
+    Assert-PackageKeys $Records $script:allNames 'CLI assembled package files'
+    $artifact = Read-PackageJson $Records['artifact.json'].text 'artifact.json'
+    $compatibility = Read-PackageJson $Records['compatibility.json'].text 'compatibility.json'
+    Assert-BridgePackageMetadata $artifact $compatibility $Records[$script:bridgeName].sha256
+    $package = Read-PackageJson $Records['package.json'].text 'package.json'
+    Assert-PackageKeys $package @('version', 'artifact_kind', 'status', 'server', 'fixture', 'build_profile', 'bridge_sha256', 'native_gui_verified', 'native_login_verified', 'verification_kind', 'package_bindings', 'completed_at_utc', 'content_sha256') 'CLI package.json'
+    Assert-PackageProtocol $package.version 'CLI package.json'
+    Assert-PackageLiteral $package.artifact_kind 'cli_connection_test' 'CLI package artifact_kind'
+    Assert-PackageLiteral $package.status 'ready_for_manual_connection_test' 'CLI package status'
+    Assert-PackageLiteral $package.server 'https://illya.test' 'CLI package server'
+    Assert-PackageLiteral $package.build_profile 'debug' 'CLI package build_profile'
+    Assert-PackageLiteral $package.verification_kind 'cli_package_bindings_command' 'CLI verification_kind'
+    Assert-PackageBoolean $package.fixture $false 'CLI package fixture'
+    Assert-PackageBoolean $package.native_gui_verified $false 'CLI native_gui_verified'
+    Assert-PackageBoolean $package.native_login_verified $false 'CLI native_login_verified'
+    Assert-PackageHash $package.bridge_sha256 'CLI package bridge_sha256'
+    if ($package.bridge_sha256 -cne $Records[$script:bridgeName].sha256) { throw 'CLI package bridge hash does not match.' }
+    Assert-CliPackageBindings $package.package_bindings $compatibility $Records[$script:bridgeName].sha256
+    if ($package.completed_at_utc -is [DateTime] -and $package.completed_at_utc.Kind -eq [DateTimeKind]::Utc) { $package.completed_at_utc = $package.completed_at_utc.ToString('o') }
+    $timestamp = [DateTime]::MinValue
+    if ($package.completed_at_utc -isnot [string] -or $package.completed_at_utc -cnotmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z$' -or ![DateTime]::TryParse($package.completed_at_utc, [ref]$timestamp)) { throw 'Invalid CLI package completion timestamp.' }
+    Assert-PackageKeys $package.content_sha256 $script:payloadNames 'CLI content_sha256'
+    foreach ($name in $script:payloadNames) {
+        Assert-PackageHash $package.content_sha256[$name] "CLI content $name"
+        if ($package.content_sha256[$name] -cne $Records[$name].sha256) { throw "CLI package content hash does not match: $name" }
+    }
+    return $package
+}
+
+function Test-KaleidoscopeCliTestPackage {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Directory)
+    return Assert-CliPackageRecords (Get-PackageFileRecords $Directory)
+}
+
+function Test-KaleidoscopeCliTestPackageArchive {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ArchivePath, [string]$Directory)
+    $records = Get-PackageArchiveRecords $ArchivePath
+    $package = Assert-CliPackageRecords $records
+    if ($Directory) {
+        $files = Get-PackageFileRecords $Directory
+        $null = Assert-CliPackageRecords $files
+        foreach ($name in $script:allNames) { if ($records[$name].sha256 -cne $files[$name].sha256) { throw "CLI ZIP does not match assembled package: $name" } }
+    }
+    return $package
+}
+
+function New-KaleidoscopeCliTestPackage {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$WorkspaceRoot,
+        [Parameter(Mandatory)][string]$LauncherPath,
+        [Parameter(Mandatory)][string]$BridgeDirectory,
+        [Parameter(Mandatory)][string]$LicensePath,
+        [Parameter(Mandatory)][string]$ExpectedCompatibilityPath,
+        [Parameter(Mandatory)][string]$OutputDirectory
+    )
+    $output = Assert-PackageWorkspacePath $OutputDirectory $WorkspaceRoot
+    $archive = Assert-PackageWorkspacePath ($output + '.zip') $WorkspaceRoot
+    if ((Test-Path -LiteralPath $output) -or (Test-Path -LiteralPath $archive)) { throw 'CLI output or ZIP already exists; choose a new output directory.' }
+    # Assembly may execute the staged diagnostic, so all sources must be owned
+    # workspace paths with no linked ancestor, before any copy or process call.
+    $LauncherPath = Assert-PackageWorkspacePath $LauncherPath $WorkspaceRoot
+    $BridgeDirectory = Assert-PackageWorkspacePath $BridgeDirectory $WorkspaceRoot
+    $LicensePath = Assert-PackageWorkspacePath $LicensePath $WorkspaceRoot
+    $ExpectedCompatibilityPath = Assert-PackageWorkspacePath $ExpectedCompatibilityPath $WorkspaceRoot
+    $sources = [ordered]@{
+        'Kaleidoscope.exe' = $LauncherPath; $script:bridgeName = (Join-Path $BridgeDirectory $script:bridgeName)
+        'artifact.json' = (Join-Path $BridgeDirectory 'artifact.json'); 'compatibility.json' = (Join-Path $BridgeDirectory 'compatibility.json')
+        'THIRD-PARTY-NOTICES.md' = (Join-Path $BridgeDirectory 'THIRD-PARTY-NOTICES.md'); 'LICENSE' = $LicensePath
+        'Transfiguration-README.md' = (Join-Path $BridgeDirectory 'README.md')
+    }
+    foreach ($name in $script:licenseNames) { $sources["licenses/$name"] = Join-Path $BridgeDirectory "licenses/$name" }
+    foreach ($name in $sources.Keys) {
+        $null = Assert-PackageWorkspacePath $sources[$name] $WorkspaceRoot
+        $source = Get-Item -LiteralPath $sources[$name] -Force
+        if ($source.PSIsContainer -or $source.Length -eq 0 -or $source.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) { throw "Missing or invalid CLI package source: $name" }
+    }
+    $bridgeHash = (Get-FileHash -LiteralPath $sources[$script:bridgeName] -Algorithm SHA256).Hash.ToLowerInvariant()
+    $compatibility = Read-PackageJson ([IO.File]::ReadAllText($sources['compatibility.json'])) 'compatibility.json'
+    Assert-BridgePackageMetadata (Read-PackageJson ([IO.File]::ReadAllText($sources['artifact.json'])) 'artifact.json') $compatibility $bridgeHash
+    $expectedHash = (Get-FileHash -LiteralPath $ExpectedCompatibilityPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ((Get-FileHash -LiteralPath $sources['compatibility.json'] -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expectedHash) { throw 'CLI compatibility differs from the tested repository manifest.' }
+    $parent = [IO.Path]::GetDirectoryName($output)
+    if (!(Test-Path -LiteralPath $parent -PathType Container)) { throw 'CLI package parent must already exist.' }
+    $stage = Assert-PackageWorkspacePath (Join-Path $parent ('.kaleidoscope-cli-staging-' + [guid]::NewGuid().ToString('N'))) $WorkspaceRoot
+    $stageZip = Assert-PackageWorkspacePath ($stage + '.zip') $WorkspaceRoot
+    [IO.Directory]::CreateDirectory((Join-Path $stage 'licenses')) | Out-Null
+    foreach ($name in $sources.Keys) { Copy-Item -LiteralPath $sources[$name] -Destination (Join-Path $stage $name) }
+    # Runs only the package diagnostic, before user storage or process APIs.
+    $bindingText = & (Join-Path $stage 'Kaleidoscope.exe') --inspect-package-bindings
+    if ($LASTEXITCODE -ne 0) { throw 'CLI compiled package binding verification failed; staging is retained.' }
+    $bindings = Read-PackageJson ($bindingText -join "`n") 'CLI diagnostic output'
+    Assert-CliPackageBindings $bindings $compatibility $bridgeHash
+    $readme = @'
+Kaleidoscope — CLI-only Illyaverse connection test (debug build)
+
+This is a command-line interim test artifact, not the desktop GUI package.
+From this directory in PowerShell, launch your installed stock lazer with:
+
+  .\Kaleidoscope.exe launcher start lazer "$env:LOCALAPPDATA\osulazer\current\osu!.exe"
+
+For a custom installation, replace that final path with its osu!.exe path.
+Use your Illyaverse website account. This package is fixed to https://illya.test
+and needs the existing local DNS/CA setup. It never falls back to official osu!.
+Only lazer 2026.1005.1 with the exact compatibility.json assembly hashes is
+accepted. Unsupported updates refuse to start; do not manually install the DLL.
+The original default/custom/portable beatmap library is reused. Private login
+and game preferences use game.illyaverse.ini; official game.ini is not copied.
+Keep the package directory in place while the game and its guardian are running.
+Close lazer normally. The guardian then removes only its unchanged owned DLL.
+For interrupted cleanup, run: .\Kaleidoscope.exe launcher recover
+To inspect launcher state: .\Kaleidoscope.exe launcher status
+To request normal game shutdown: .\Kaleidoscope.exe launcher stop
+Do not run recovery while another lazer instance is using the same library.
+
+The package diagnostic only reads this package. It can be run without a game:
+  .\Kaleidoscope.exe --inspect-package-bindings
+Package hash validation does not prove login, gameplay, score upload or native
+GUI behavior. Those remain user-operated testing. No client is redistributed.
+See compatibility.json, Transfiguration-README.md and THIRD-PARTY-NOTICES.md.
+'@
+    [IO.File]::WriteAllText((Join-Path $stage 'README.txt'), $readme, [Text.UTF8Encoding]::new($false))
+    $hashes = [ordered]@{}
+    foreach ($name in $script:payloadNames) { $hashes[$name] = (Get-FileHash -LiteralPath (Join-Path $stage $name) -Algorithm SHA256).Hash.ToLowerInvariant() }
+    if ($hashes['Kaleidoscope.exe'] -cne (Get-FileHash -LiteralPath $LauncherPath -Algorithm SHA256).Hash.ToLowerInvariant() -or $hashes[$script:bridgeName] -cne $bridgeHash -or $hashes['compatibility.json'] -cne $expectedHash) { throw 'CLI source changed during assembly.' }
+    $manifest = [ordered]@{
+        version = 1; artifact_kind = 'cli_connection_test'; status = 'ready_for_manual_connection_test'
+        server = 'https://illya.test'; fixture = $false; build_profile = 'debug'; bridge_sha256 = $bridgeHash
+        native_gui_verified = $false; native_login_verified = $false; verification_kind = 'cli_package_bindings_command'
+        package_bindings = $bindings; completed_at_utc = [DateTime]::UtcNow.ToString('o'); content_sha256 = $hashes
+    }
+    [IO.File]::WriteAllText((Join-Path $stage 'package.json'), ($manifest | ConvertTo-Json -Depth 12), [Text.UTF8Encoding]::new($false))
+    $null = Test-KaleidoscopeCliTestPackage -Directory $stage
+    [IO.Compression.ZipFile]::CreateFromDirectory($stage, $stageZip, [IO.Compression.CompressionLevel]::Optimal, $false)
+    $null = Test-KaleidoscopeCliTestPackageArchive -ArchivePath $stageZip -Directory $stage
+    $null = Assert-PackageWorkspacePath $stage $WorkspaceRoot
+    $null = Assert-PackageWorkspacePath $output $WorkspaceRoot
+    [IO.Directory]::Move($stage, $output)
+    $null = Assert-PackageWorkspacePath $stageZip $WorkspaceRoot
+    $null = Assert-PackageWorkspacePath $archive $WorkspaceRoot
+    [IO.File]::Move($stageZip, $archive)
+    return [pscustomobject]@{ Directory = $output; Archive = $archive; ArtifactKind = 'cli_connection_test'; LauncherSha256 = $hashes['Kaleidoscope.exe']; BridgeSha256 = $bridgeHash }
 }
 
 function New-KaleidoscopePackage {
@@ -296,4 +466,4 @@ See Transfiguration-README.md, compatibility.json, and THIRD-PARTY-NOTICES.md.
     return [pscustomobject]@{ Directory = $output; Archive = $archive; VerificationKind = $InterfaceEvidence.kind }
 }
 
-Export-ModuleMember -Function Assert-PackageWorkspacePath, Test-KaleidoscopePackage, Test-KaleidoscopePackageArchive, New-KaleidoscopePackage
+Export-ModuleMember -Function Assert-PackageWorkspacePath, Test-KaleidoscopePackage, Test-KaleidoscopePackageArchive, New-KaleidoscopePackage, Test-KaleidoscopeCliTestPackage, Test-KaleidoscopeCliTestPackageArchive, New-KaleidoscopeCliTestPackage
