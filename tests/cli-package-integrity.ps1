@@ -28,6 +28,15 @@ function Copy-Fixture([string]$Name) {
     return $copy
 }
 function Write-Json([string]$Path, $Value) { [IO.File]::WriteAllText($Path, ($Value | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false)) }
+function Read-FixtureJson([string]$Path) {
+    $options = @{ InputObject = (Get-Content -LiteralPath $Path -Raw); AsHashtable = $true }
+    if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')) { $options.DateKind = 'String' }
+    $value = ConvertFrom-Json @options
+    if ($value.ContainsKey('completed_at_utc') -and $value.completed_at_utc -is [DateTime]) {
+        $value.completed_at_utc = $value.completed_at_utc.ToUniversalTime().ToString('o')
+    }
+    return $value
+}
 function Get-ByteInventory([string]$Directory) {
     $records = [ordered]@{}
     foreach ($item in Get-ChildItem -LiteralPath $Directory -File -Recurse -Force) {
@@ -46,11 +55,16 @@ function Expect-DiagnosticRefusal([string]$Directory, [string]$Name) {
 try {
     [IO.Directory]::CreateDirectory($root) | Out-Null
     Write-Json (Join-Path $root '.owner.json') @{ identity = $identity; root = $root }
+    $timestampFixture = Join-Path $root 'timestamp-roundtrip.json'
+    Write-Json $timestampFixture @{ completed_at_utc = '2026-10-09T00:00:00.1234560Z' }
+    $timestampValue = Read-FixtureJson $timestampFixture
+    Write-Json $timestampFixture $timestampValue
+    Assert-Check ((Read-FixtureJson $timestampFixture).completed_at_utc -ceq '2026-10-09T00:00:00.1234560Z') 'fixture mutation preserves all seven UTC timestamp digits'
     $null = Test-KaleidoscopeCliTestPackageArchive -ArchivePath ($package + '.zip') -Directory $package
     Assert-Check $true 'production CLI directory and ZIP match every payload byte'
     $bindings = (& (Join-Path $package 'Kaleidoscope.exe') --inspect-package-bindings | Out-String) | ConvertFrom-Json -AsHashtable
     Assert-Check ($LASTEXITCODE -eq 0 -and $bindings.bridge_verified -eq $true -and $bindings.official_fallback -eq $false -and $bindings.shared_existing_library -eq $true) 'actual production-bound CLI diagnostic passes'
-    $manifest = Get-Content -LiteralPath (Join-Path $package 'package.json') -Raw | ConvertFrom-Json -AsHashtable
+    $manifest = Read-FixtureJson (Join-Path $package 'package.json')
     Assert-Check ($manifest.artifact_kind -ceq 'cli_connection_test' -and $manifest.native_gui_verified -eq $false -and $manifest.native_login_verified -eq $false) 'CLI manifest keeps GUI and login unverified'
     Expect-Refusal 'desktop GUI verifier rejects CLI-only evidence' { Test-KaleidoscopePackage -Directory $package }
 
@@ -109,14 +123,14 @@ try {
     $wrong = Copy-Fixture 'wrong'
     [IO.File]::WriteAllText((Join-Path $wrong 'osu.Game.Rulesets.Transfiguration.dll'), 'wrong DLL fixture; never loaded')
     $wrongHash = (Get-FileHash -LiteralPath (Join-Path $wrong 'osu.Game.Rulesets.Transfiguration.dll') -Algorithm SHA256).Hash.ToLowerInvariant()
-    $artifact = Get-Content -LiteralPath (Join-Path $wrong 'artifact.json') -Raw | ConvertFrom-Json -AsHashtable
+    $artifact = Read-FixtureJson (Join-Path $wrong 'artifact.json')
     $artifact.sha256 = $wrongHash
     Write-Json (Join-Path $wrong 'artifact.json') $artifact
     Expect-DiagnosticRefusal $wrong 'metadata-replaced-wrong-bridge'
 
     foreach ($field in @('official_fallback', 'private_config_filename', 'native_login_verified', 'artifact_kind')) {
         $tampered = Copy-Fixture ('policy-' + $field)
-        $value = Get-Content -LiteralPath (Join-Path $tampered 'package.json') -Raw | ConvertFrom-Json -AsHashtable
+        $value = Read-FixtureJson (Join-Path $tampered 'package.json')
         switch ($field) {
             'official_fallback' { $value.package_bindings.official_fallback = $true }
             'private_config_filename' { $value.package_bindings.private_config_filename = 'game.ini' }
@@ -128,7 +142,7 @@ try {
     }
     $mismatch = Copy-Fixture 'zip-mismatch'
     [IO.File]::AppendAllText((Join-Path $mismatch 'README.txt'), "`nFixture changed README.")
-    $value = Get-Content -LiteralPath (Join-Path $mismatch 'package.json') -Raw | ConvertFrom-Json -AsHashtable
+    $value = Read-FixtureJson (Join-Path $mismatch 'package.json')
     $value.content_sha256['README.txt'] = (Get-FileHash -LiteralPath (Join-Path $mismatch 'README.txt') -Algorithm SHA256).Hash.ToLowerInvariant()
     Write-Json (Join-Path $mismatch 'package.json') $value
     $null = Test-KaleidoscopeCliTestPackage -Directory $mismatch
