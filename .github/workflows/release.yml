@@ -90,7 +90,7 @@ jobs:
         shell: pwsh
         working-directory: workspace
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.ILLYAVERSE_READ_TOKEN || github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
           $pin = Get-Content -LiteralPath tools/kaleidoscope/bridge-release.json -Raw | ConvertFrom-Json
@@ -185,7 +185,7 @@ jobs:
       - name: Download and verify the pinned Transfiguration bridge
         working-directory: workspace
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.ILLYAVERSE_READ_TOKEN || github.token }}
         run: |
           set -eu
           repository=$(node -p "require('./tools/kaleidoscope/bridge-release.json').repository || ''")
