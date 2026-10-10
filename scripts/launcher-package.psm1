@@ -182,9 +182,24 @@ function Assert-BridgePackageMetadata($Artifact, $Compatibility, [string]$Bridge
         private_credential_save_logout_remember_flags = 'passed_headless_native_handlers_worker_intercepted'
         real_api_worker_refresh_and_login = 'pending_human_test'; native_gui_and_login = 'pending_human_test'
     }
+    $parameterizedRequestContracts = @(
+        'GetScoresRequest.CreateWebRequest:query-list variant partition',
+        'GetUserScoresRequest.CreateWebRequest:query-list variant partition',
+        'GetUserRankingsRequest.CreateWebRequest:query-list variant partition'
+    )
+    $currentRequestBuilders = @($parameterizedRequestContracts | Where-Object { $contracts.Contains($_) }).Count -gt 0 -or
+        ($Compatibility.verification -is [System.Collections.IDictionary] -and @($Compatibility.verification.Keys) -ccontains 'rx_native_parameterized_request_builders')
+    if ($currentRequestBuilders) {
+        foreach ($contract in $parameterizedRequestContracts) {
+            if (!$contracts.Contains($contract)) { throw "Missing mandatory compatibility contract: $contract" }
+        }
+        $verification.rx_native_request_context = 'passed_pinned_metadata_and_inert_native_builders'
+        $verification.rx_native_parameterized_request_builders = 'passed_inert_stock_builders'
+        $verification.explicit_ui_current_session_revocation = 'pending_human_test'
+    }
     # Older compatibility receipts predate the explicit logout contract. Accept
     # its current pending state when present without relaxing any other fields.
-    if ($Compatibility.verification -is [System.Collections.IDictionary] -and @($Compatibility.verification.Keys) -ccontains 'explicit_ui_current_session_revocation') {
+    elseif ($Compatibility.verification -is [System.Collections.IDictionary] -and @($Compatibility.verification.Keys) -ccontains 'explicit_ui_current_session_revocation') {
         $verification.explicit_ui_current_session_revocation = 'pending_human_test'
     }
     Assert-PackageKeys $Compatibility.verification @($verification.Keys) 'compatibility.json.verification'

@@ -221,7 +221,8 @@ async function verifyGuiPackage(directory, archivePath, workspaceRoot) {
   const modulePath = await assertUnlinkedPath(resolve(workspaceRoot, 'tools/kaleidoscope/scripts/launcher-package.psm1'));
   // Parameters cross a process boundary through environment variables, never
   // interpolated PowerShell source. The existing verifier admits production
-  // GUI packages only, checks the ZIP's bounded entries and compares all bytes.
+  // GUI packages only (including local Debug builds), checks the ZIP's bounded
+  // entries and compares all bytes. The publisher enforces Release separately.
   await boundedProcess('pwsh', ['-NoProfile', '-NonInteractive', '-Command',
     "$ErrorActionPreference = 'Stop'; Import-Module -Name $env:KALEIDOSCOPE_RELEASE_VERIFIER -Force; Test-KaleidoscopePackage -Directory $env:KALEIDOSCOPE_RELEASE_DIRECTORY | Out-Null; Test-KaleidoscopePackageArchive -ArchivePath $env:KALEIDOSCOPE_RELEASE_ARCHIVE -Directory $env:KALEIDOSCOPE_RELEASE_DIRECTORY | Out-Null"],
   { env: { ...process.env, KALEIDOSCOPE_RELEASE_VERIFIER: modulePath, KALEIDOSCOPE_RELEASE_DIRECTORY: directory, KALEIDOSCOPE_RELEASE_ARCHIVE: archivePath } });
@@ -266,8 +267,11 @@ export async function createUpdateRelease(options, environment = process.env) {
   assert(!outputExists, 'Release output already exists; choose a fresh directory.');
   const archive = await lstat(archivePath);
   assert(archive.isFile() && archive.size > 0 && archive.size <= MAX_ARCHIVE_BYTES, 'Update archive is invalid or exceeds the size limit.');
-  await verifyComponentPins(workspaceRoot, options.kaleidoscopeCommit, options.transfigurationCommit);
   const before = await collectPackageHashes(packageDirectory);
+  let packageMetadata;
+  try { packageMetadata = JSON.parse(await readFile(resolve(packageDirectory, 'package.json'), 'utf8')); } catch { throw new Error('Invalid GUI package metadata.'); }
+  assert(packageMetadata !== null && typeof packageMetadata === 'object' && !Array.isArray(packageMetadata) && packageMetadata.build_profile === 'release', 'Only Release GUI packages may be published: package.json build_profile must be "release".');
+  await verifyComponentPins(workspaceRoot, options.kaleidoscopeCommit, options.transfigurationCommit);
   const archiveHash = await sha256(archivePath);
   await verifyGuiPackage(packageDirectory, archivePath, workspaceRoot);
   const diagnostic = await boundedProcess(resolve(packageDirectory, 'Kaleidoscope.exe'), ['--verify-update-config']);

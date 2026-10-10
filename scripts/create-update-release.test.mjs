@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import { createHash, generateKeyPairSync, verify } from 'node:crypto';
-import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { GUI_FILES, MAX_ARCHIVE_BYTES, assertUnlinkedPath, buildManifest, collectPackageHashes, createSignedEnvelope, validateCompiledUpdateConfig, validateRepository, validateVersion } from './create-update-release.mjs';
+import { GUI_FILES, MAX_ARCHIVE_BYTES, assertUnlinkedPath, buildManifest, collectPackageHashes, createSignedEnvelope, createUpdateRelease, validateCompiledUpdateConfig, validateRepository, validateVersion } from './create-update-release.mjs';
 
 const hash = (text) => createHash('sha256').update(text).digest('hex');
 const hashes = () => Object.fromEntries(GUI_FILES.map((name) => [name, hash(name)]));
@@ -111,6 +111,38 @@ test('compiled channel diagnostic must match the signed release and contain no e
   validateCompiledUpdateConfig(config, expected);
   const oldDiagnostic = { ...config }; delete oldDiagnostic.bridge_version;
   for (const changed of [oldDiagnostic, { ...config, bridge_version: '0.0.9' }, { ...config, configured: false }, { ...config, version: '1.2.2' }, { ...config, repository: 'other/repo' }, { ...config, public_key: 'b'.repeat(64) }, { ...config, protocol: 2 }, { ...config, extra: true }]) assert.throws(() => validateCompiledUpdateConfig(changed, expected));
+});
+
+async function publisherFixture(directory, packageDirectory, metadata, run) {
+  const archivePath = join(directory, 'synthetic.zip');
+  const outputDirectory = join(directory, 'release-output');
+  await writeFile(join(packageDirectory, 'package.json'), JSON.stringify(metadata));
+  await writeFile(archivePath, 'synthetic archive; never passed to an executable verifier');
+  const options = { ...input(), packageDirectory, archivePath, outputDirectory, workspaceRoot: directory };
+  const environment = { KALEIDOSCOPE_UPDATE_REPOSITORY: options.repository, KALEIDOSCOPE_UPDATE_PUBLIC_KEY: 'a'.repeat(64), KALEIDOSCOPE_UPDATE_SIGNING_KEY_FILE: join(directory, 'absent-signing-key.pem') };
+  await run(() => createUpdateRelease(options, environment));
+  await assert.rejects(() => lstat(outputDirectory), { code: 'ENOENT' });
+}
+
+test('publisher rejects non-Release metadata before source checks, executable diagnostics or signing', { skip: process.platform !== 'win32' }, async () => {
+  await packageFixture(async (directory, packageDirectory) => {
+    for (const metadata of [{ build_profile: 'debug' }, { build_profile: 'synthetic' }, {}, { build_profile: 'Release' }, { build_profile: 'release\n' }, { build_profile: 'production' }, { build_profile: true }, { build_profile: null }, null, []]) {
+      await publisherFixture(directory, packageDirectory, metadata, async (publish) => {
+        await assert.rejects(publish, /Only Release GUI packages may be published: package\.json build_profile must be "release"\./);
+      });
+    }
+  });
+});
+
+test('publisher accepts Release metadata and proceeds to the existing source gate without staging output', { skip: process.platform !== 'win32' }, async () => {
+  await packageFixture(async (directory, packageDirectory) => {
+    await publisherFixture(directory, packageDirectory, { build_profile: 'release' }, async (publish) => {
+      // This fixture deliberately has no child checkout. Reaching this path
+      // proves the profile gate passed while never executing a fake launcher,
+      // running the archive verifier or reading a signing key.
+      await assert.rejects(publish, (error) => error.code === 'ENOENT' && error.path === join(directory, 'tools', 'kaleidoscope'));
+    });
+  });
 });
 
 test('file collection hashes every exact permitted payload including package.json', async () => {

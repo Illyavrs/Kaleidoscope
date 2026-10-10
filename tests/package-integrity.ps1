@@ -1,4 +1,4 @@
-param()
+param([switch]$CompatibilityOnly)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '../../..')).Path
@@ -77,6 +77,7 @@ function Test-CompatibilityJson([string]$Text) {
 try {
     # In-memory JSON exercises the actual private parser/validator. These hashes
     # are fixtures; no package, executable, player settings or network is read.
+    if (!$CompatibilityOnly) {
     $bindingsText = New-SourceBindingsFixture | ConvertTo-Json -Depth 10
     Test-SourceBindingsJson $bindingsText
     $checks++
@@ -107,24 +108,44 @@ try {
     $duplicate = $bindingsText.Replace('"shared_game_preferences": true', '"shared_game_preferences": true, "shared_game_preferences": true')
     Assert-Fixture ($duplicate -cne $bindingsText) 'Duplicate source binding fixture was not created.'
     Expect-Refusal 'source bindings reject duplicate auth policy field' { Test-SourceBindingsJson $duplicate } '*Invalid package JSON*'
+    }
 
     # Exercise metadata validation directly so a changed source-file hash cannot
     # mask a malformed verification value. All artifact bytes/hashes are fake.
     $compatibility = Get-Content -LiteralPath (Join-Path $repo 'tools/transfiguration/compatibility.json') -Raw
+    $parameterizedRequestContracts = @(
+        'GetScoresRequest.CreateWebRequest:query-list variant partition',
+        'GetUserScoresRequest.CreateWebRequest:query-list variant partition',
+        'GetUserRankingsRequest.CreateWebRequest:query-list variant partition'
+    )
     $legacy = $compatibility | ConvertFrom-Json -AsHashtable
+    $legacy.contracts = @($legacy.contracts | Where-Object { $parameterizedRequestContracts -cnotcontains $_ })
+    $legacy.verification.Remove('rx_native_parameterized_request_builders')
+    $legacy.verification.rx_native_request_context = 'passed_headless'
     $legacy.verification.Remove('explicit_ui_current_session_revocation')
+    $fakeAssembly = 0
+    foreach ($assembly in $legacy.assemblies.Keys) { $fakeAssembly++; $legacy.assemblies[$assembly].sha256 = ([string]$fakeAssembly * 64) }
     Assert-Fixture ($legacy.verification.Count -eq 15 -and $legacy.assemblies.Count -eq 5) 'Legacy compatibility fixture changed its verification or assembly boundary.'
     $legacyText = $legacy | ConvertTo-Json -Depth 20
     Test-CompatibilityJson $legacyText
     $checks++
     Write-Output 'PASS legacy 15-field compatibility verification with original five assembly bindings'
-    $current = $legacyText | ConvertFrom-Json -AsHashtable
-    $current.verification.explicit_ui_current_session_revocation = 'pending_human_test'
-    Assert-Fixture ($current.verification.Count -eq 16) 'Current compatibility fixture did not add exactly one field.'
+    $legacyLogout = $legacyText | ConvertFrom-Json -AsHashtable
+    $legacyLogout.verification.explicit_ui_current_session_revocation = 'pending_human_test'
+    Assert-Fixture ($legacyLogout.verification.Count -eq 16) 'Legacy logout compatibility fixture did not add exactly one field.'
+    $legacyLogoutText = $legacyLogout | ConvertTo-Json -Depth 20
+    Test-CompatibilityJson $legacyLogoutText
+    $checks++
+    Write-Output 'PASS legacy 16-field compatibility verification keeps explicit logout pending human test'
+    $current = $legacyLogoutText | ConvertFrom-Json -AsHashtable
+    $current.contracts += $parameterizedRequestContracts
+    $current.verification.rx_native_request_context = 'passed_pinned_metadata_and_inert_native_builders'
+    $current.verification.rx_native_parameterized_request_builders = 'passed_inert_stock_builders'
+    Assert-Fixture ($current.verification.Count -eq 17) 'Parameterized compatibility fixture did not preserve its exact field boundary.'
     $currentText = $current | ConvertTo-Json -Depth 20
     Test-CompatibilityJson $currentText
     $checks++
-    Write-Output 'PASS current 16-field compatibility verification keeps explicit logout pending human test'
+    Write-Output 'PASS current 17-field compatibility verification requires the completed inert request-builder proof'
     foreach ($case in @('unknown-field', 'wrong-case-logout', 'logout-passed', 'logout-false', 'logout-true', 'logout-null', 'logout-array', 'verification-boolean', 'verification-array')) {
         $value = $currentText | ConvertFrom-Json -AsHashtable
         switch ($case) {
@@ -141,6 +162,34 @@ try {
         $text = $value | ConvertTo-Json -Depth 20
         Expect-Refusal "compatibility verification rejects $case" { Test-CompatibilityJson $text } '*compatibility.json.verification*'
     }
+    foreach ($case in @('current-proof-pending', 'context-pending', 'context-legacy', 'missing-context', 'builder-pending', 'builder-overclaim', 'builder-boolean', 'missing-builder-proof', 'wrong-case-builder-proof', 'missing-logout', 'missing-one-builder-contract', 'missing-all-builder-contracts', 'legacy-with-builder-contract', 'legacy-with-builder-proof')) {
+        $value = $currentText | ConvertFrom-Json -AsHashtable
+        switch ($case) {
+            'current-proof-pending' { $value.verification.rx_native_request_context = 'pending_current_bridge_proof'; $value.verification.rx_native_parameterized_request_builders = 'pending_inert_stock_builder_verification' }
+            'context-pending' { $value.verification.rx_native_request_context = 'pending_current_bridge_proof' }
+            'context-legacy' { $value.verification.rx_native_request_context = 'passed_headless' }
+            'missing-context' { $value.verification.Remove('rx_native_request_context') }
+            'builder-pending' { $value.verification.rx_native_parameterized_request_builders = 'pending_inert_stock_builder_verification' }
+            'builder-overclaim' { $value.verification.rx_native_parameterized_request_builders = 'passed_native_gameplay' }
+            'builder-boolean' { $value.verification.rx_native_parameterized_request_builders = $true }
+            'missing-builder-proof' { $value.verification.Remove('rx_native_parameterized_request_builders') }
+            'wrong-case-builder-proof' { $value.verification.Remove('rx_native_parameterized_request_builders'); $value.verification.RX_NATIVE_PARAMETERIZED_REQUEST_BUILDERS = 'passed_inert_stock_builders' }
+            'missing-logout' { $value.verification.Remove('explicit_ui_current_session_revocation') }
+            'missing-one-builder-contract' { $value.contracts = @($value.contracts | Where-Object { $_ -cne $parameterizedRequestContracts[0] }) }
+            'missing-all-builder-contracts' { $value.contracts = @($value.contracts | Where-Object { $parameterizedRequestContracts -cnotcontains $_ }) }
+            'legacy-with-builder-contract' { $value = $legacyLogoutText | ConvertFrom-Json -AsHashtable; $value.contracts += $parameterizedRequestContracts[0] }
+            'legacy-with-builder-proof' { $value = $legacyLogoutText | ConvertFrom-Json -AsHashtable; $value.verification.rx_native_parameterized_request_builders = 'passed_inert_stock_builders' }
+        }
+        $text = $value | ConvertTo-Json -Depth 20
+        Expect-Refusal "parameterized compatibility rejects $case" { Test-CompatibilityJson $text }
+    }
+    if ($CompatibilityOnly) {
+        Write-Output "PASS $checks in-memory compatibility checks. No filesystem fixtures, EXE/DLL, package assembly, player settings or network accessed."
+        return
+    }
+    # Package assembly below uses the same completed synthetic metadata fixture,
+    # regardless of the source manifest's honest pending proof state.
+    $compatibility = $currentText
     [IO.Directory]::CreateDirectory($fixtureRoot) | Out-Null
     $owner = Join-Path $fixtureRoot '.owner.json'
     $ownerStream = [IO.File]::Open($owner, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)

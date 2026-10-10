@@ -65,6 +65,11 @@ The interface runs on port 3010. Packaging builds the bridge, production interfa
 and native launcher into a directory and ZIP, without bundling osu!. See the
 launcher guide for custom paths and verification.
 
+The manual parent CI producer builds verified Release packages on a dedicated
+Windows runner. See [Release builds](https://github.com/Illyavrs/Illyaverse/blob/main/docs/launcher-release-builds.md)
+for runner configuration, source receipts and separate publishing. Actual CI
+Release builds remain pending.
+
 ## Updates and status
 
 Signed updates have independent feeds for complete launcher packages from
