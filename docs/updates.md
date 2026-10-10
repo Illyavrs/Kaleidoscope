@@ -19,7 +19,7 @@ Build the launcher with these explicit settings:
 
 | Setting | Value |
 | --- | --- |
-| `KALEIDOSCOPE_UPDATE_REPOSITORY` | The controlled GitHub repository, `owner/Kaleidoscope` |
+| `KALEIDOSCOPE_UPDATE_REPOSITORY` | The controlled GitHub repository, `Illyavrs/Kaleidoscope` |
 | `KALEIDOSCOPE_UPDATE_PUBLIC_KEY` | The Ed25519 public key's raw 32 bytes, as 64 lowercase hexadecimal characters |
 | `KALEIDOSCOPE_UPDATE_VERSION` | The package's semantic version, for example `0.1.0` |
 | `TRANSFIGURATION_BUNDLED_VERSION` | The exact bundled bridge version, for example the current base `0.1.0` |
@@ -71,7 +71,7 @@ From the parent checkout, with the channel environment already configured:
 node tools/kaleidoscope/scripts/create-update-release.mjs `
   --version 0.1.0 `
   --bridge-version 0.1.0 `
-  --repository YourOrganisation/Kaleidoscope `
+  --repository Illyavrs/Kaleidoscope `
   --package-directory .artifacts/packages/your-verified-gui-package `
   --archive .artifacts/packages/your-verified-gui-package.zip `
   --output-directory .artifacts/update-releases/0.1.0 `
@@ -102,7 +102,7 @@ reserializing them. The signed inner JSON has exactly these fields:
   "protocol": 1,
   "version": "0.1.0",
   "platform": "windows-x64",
-  "repository": "YourOrganisation/Kaleidoscope",
+  "repository": "Illyavrs/Kaleidoscope",
   "tag": "v0.1.0",
   "asset": "Kaleidoscope-0.1.0-windows-x64.zip",
   "bytes": 12345,
@@ -166,7 +166,7 @@ updates:
 
 | Setting | Value |
 | --- | --- |
-| `TRANSFIGURATION_UPDATE_REPOSITORY` | The controlled GitHub repository, `owner/Transfiguration` |
+| `TRANSFIGURATION_UPDATE_REPOSITORY` | The controlled GitHub repository, `Illyavrs/Transfiguration` |
 | `TRANSFIGURATION_UPDATE_PUBLIC_KEY` | That feed's separate Ed25519 public key, as 64 lowercase hexadecimal characters |
 | `TRANSFIGURATION_BUNDLED_VERSION` | The bridge version in the complete launcher package; the current base is `0.1.0` |
 

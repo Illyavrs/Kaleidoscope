@@ -17,6 +17,7 @@ on:
       parent_repository:
         description: Published Illyaverse parent repository (owner/repo)
         required: true
+        default: Illyavrs/Illyaverse
         type: string
       parent_commit:
         description: Exact 40-character Illyaverse commit used by the build
