@@ -56,7 +56,7 @@ export function ServerSettings({ settings, activeEndpoint, interactive, busy, op
           <ShieldCheck size={18} aria-hidden="true" />
           <div><strong>Illyaverse</strong><p data-testid="saved-endpoint">{settings?.endpoint ?? (loadError ? '設定尚未讀取' : '正在讀取伺服器設定…')}</p></div>
         </div>
-        <Button variant="quiet" onClick={toggle} disabled={busy || !settings} aria-expanded={open} aria-controls="server-settings-panel">
+        <Button variant="quiet" onClick={toggle} disabled={busy || operationBusy || !settings} aria-expanded={open} aria-controls="server-settings-panel">
           <Settings2 size={15} aria-hidden="true" />設定
         </Button>
       </div>

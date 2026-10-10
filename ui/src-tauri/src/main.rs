@@ -1,6 +1,8 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use kaleidoscope::launcher::runtime::{self, Client, LauncherSettings, Snapshot};
+use kaleidoscope::launcher::updater::{self, Manager, UpdateComponent, UpdateStatus};
+use std::sync::Mutex;
 use tauri_plugin_dialog::DialogExt;
 
 #[tauri::command]
@@ -63,6 +65,50 @@ async fn launcher_recover() -> Result<Snapshot, String> {
     tauri::async_runtime::spawn_blocking(runtime::recover)
         .await
         .map_err(|_| "Plugin cleanup could not complete".to_owned())?
+}
+
+#[tauri::command]
+fn launcher_update_status() -> UpdateStatus {
+    updater::status()
+}
+
+#[tauri::command]
+fn launcher_update_ready() -> Result<(), String> {
+    updater::acknowledge_ready(&std::env::args().skip(1).collect::<Vec<_>>())
+}
+
+#[tauri::command]
+async fn launcher_update_check(
+    manager: tauri::State<'_, std::sync::Arc<Mutex<Manager>>>,
+) -> Result<UpdateStatus, String> {
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        manager
+            .lock()
+            .map_err(|_| "更新狀態無法讀取".to_owned())?
+            .check()
+    })
+    .await
+    .map_err(|_| "更新檢查未完成".to_owned())?
+}
+
+#[tauri::command]
+async fn launcher_update_install(
+    app: tauri::AppHandle,
+    manager: tauri::State<'_, std::sync::Arc<Mutex<Manager>>>,
+    component: UpdateComponent,
+) -> Result<(), String> {
+    let manager = manager.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        manager
+            .lock()
+            .map_err(|_| "更新狀態無法讀取".to_owned())?
+            .install(component)
+    })
+    .await
+    .map_err(|_| "更新安裝未完成".to_owned())??;
+    app.exit(0);
+    Ok(())
 }
 
 fn html_attribute<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
@@ -144,6 +190,36 @@ fn verify_embedded_interface() -> Result<(), String> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--verify-update-config") {
+        let result = if args.len() == 1 {
+            updater::build_configuration()
+        } else {
+            Err("Use --verify-update-config without other arguments".to_owned())
+        };
+        match result {
+            Ok(configuration) => {
+                println!(
+                    "{}",
+                    serde_json::to_string(&configuration)
+                        .expect("serializable update configuration")
+                );
+                std::process::exit(0);
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+        }
+    }
+    if let Some(result) = updater::handle_internal(&args) {
+        match result {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+        }
+    }
     // This proof must exit before launcher commands, user-data access, or GUI initialization.
     if args.iter().any(|arg| arg == "--verify-embedded-interface") {
         let result = if args.len() == 1 {
@@ -169,6 +245,7 @@ fn main() {
         }
     }
     tauri::Builder::default()
+        .manage(std::sync::Arc::new(Mutex::new(Manager::default())))
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             launcher_snapshot,
@@ -177,7 +254,11 @@ fn main() {
             launcher_choose_path,
             launcher_start,
             launcher_stop,
-            launcher_recover
+            launcher_recover,
+            launcher_update_status,
+            launcher_update_ready,
+            launcher_update_check,
+            launcher_update_install
         ])
         .run(tauri::tauri_build_context!())
         .expect("Kaleidoscope desktop initialization failed");

@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Check, CircleHelp, FolderOpen, LoaderCircle, Play, RotateCcw, Square, TriangleAlert } from 'lucide-react';
 import { Button } from './button';
 import { ServerSettings } from './server-settings';
+import { Updates } from './updates';
 import { createLauncherBridge, emptySnapshot, type Client, type LauncherBridge, type LauncherCommand, type LauncherSettings, type LauncherSnapshot, type Phase } from '@/lib/runtime';
 
 const labels: Record<Phase, string> = {
@@ -60,6 +61,9 @@ export function Launcher() {
   const [settings, setSettings] = useState<LauncherSettings | null>(null);
   const [settingsPending, setSettingsPending] = useState(false);
   const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [updatePending, setUpdatePending] = useState(false);
+  const updating = useRef(false);
+  const readyRuntime = useRef<LauncherBridge | null>(null);
   const changingSettings = useRef(false);
   const mounted = useRef(false);
   const invoking = useRef(false);
@@ -103,8 +107,19 @@ export function Launcher() {
     return () => { active = false; mounted.current = false; if (timer) clearInterval(timer); };
   }, []);
 
+  useEffect(() => {
+    if (!bridge || bridge.mode !== 'native' || readyRuntime.current === bridge) return;
+    let active = true;
+    readyRuntime.current = bridge;
+    // This effect runs after the validated snapshot and launcher content commit.
+    void bridge.ready().catch(() => {
+      if (active) setSnapshot((current) => ({ ...current, phase: 'error', detail: '新版介面無法完成啟動確認。請重新開啟啟動器。' }));
+    });
+    return () => { active = false; };
+  }, [bridge]);
+
   async function action(command: LauncherCommand, client?: Client) {
-    if (!bridge?.interactive || invoking.current || changingSettings.current
+    if (!bridge?.interactive || invoking.current || changingSettings.current || updating.current
       || (!settings && (command === 'launcher_start' || command === 'launcher_choose_path'))) return;
     invoking.current = true;
     sequence.current += 1;
@@ -132,7 +147,7 @@ export function Launcher() {
   }
 
   async function saveEndpoint(endpoint: string): Promise<LauncherSettings> {
-    if (!bridge?.interactive || invoking.current || changingSettings.current) throw new Error('請等待目前操作完成後再儲存。');
+    if (!bridge?.interactive || invoking.current || changingSettings.current || updating.current) throw new Error('請等待目前操作完成後再儲存。');
     changingSettings.current = true;
     setSettingsPending(true);
     try {
@@ -146,7 +161,7 @@ export function Launcher() {
   }
 
   async function retrySettings() {
-    if (!bridge || changingSettings.current) return;
+    if (!bridge || changingSettings.current || updating.current) return;
     changingSettings.current = true;
     setSettingsPending(true);
     try {
@@ -160,7 +175,7 @@ export function Launcher() {
     }
   }
 
-  const busy = pending || busyPhases.includes(snapshot.phase);
+  const busy = pending || updatePending || busyPhases.includes(snapshot.phase);
   const cleanupFailed = snapshot.phase === 'cleanup_failed';
   const blocked = !bridge?.interactive || busy || settingsPending || !settings || cleanupFailed;
   const running = snapshot.stable.running || snapshot.lazer.running;
@@ -168,6 +183,19 @@ export function Launcher() {
   const cleanupTitle = snapshot.phase === 'cleaning' ? '正在清理連線 ruleset'
     : cleanupFailed ? '連線 ruleset 尚未清理'
       : snapshot.pluginPresent ? '連線 ruleset 使用中' : '沒有暫存的連線 ruleset';
+
+  function beginUpdate() {
+    if (!bridge?.interactive || updating.current || invoking.current || changingSettings.current || snapshot.phase !== 'idle'
+      || snapshot.stable.running || snapshot.lazer.running || snapshot.pluginPresent) return false;
+    updating.current = true;
+    setUpdatePending(true);
+    return true;
+  }
+
+  function endUpdate() {
+    updating.current = false;
+    if (mounted.current) setUpdatePending(false);
+  }
 
   return (
     <main className="launcher-shell">
@@ -181,11 +209,12 @@ export function Launcher() {
           loadError={settingsError} retry={() => void retrySettings()} save={saveEndpoint} />
         <ClientRow client="stable" snapshot={snapshot} endpoint={settings?.endpoint ?? null} disabled={blocked} choose={() => void action('launcher_choose_path', 'stable')} run={() => void action('launcher_start', 'stable')} />
         <ClientRow client="lazer" snapshot={snapshot} endpoint={settings?.endpoint ?? null} disabled={blocked} choose={() => void action('launcher_choose_path', 'lazer')} run={() => void action('launcher_start', 'lazer')} />
+        <Updates bridge={bridge} installBlocked={busy || settingsPending || running || snapshot.pluginPresent || snapshot.phase !== 'idle'} beginInstall={beginUpdate} endInstall={endUpdate} />
       </div>
       <section className={`lifecycle ${error ? 'has-error' : ''}`} aria-label="啟動與清理狀態">
         <div className="lifecycle-main">
           <div className="state-symbol">{busy ? <LoaderCircle className="spin" size={19} aria-hidden="true" /> : error ? <TriangleAlert size={19} aria-hidden="true" /> : <Check size={19} aria-hidden="true" />}</div>
-          <div className="lifecycle-copy" aria-live="polite" aria-atomic="true"><strong>{labels[snapshot.phase]}</strong><p>{snapshot.detail}</p></div>
+          <div className="lifecycle-copy" aria-live="polite" aria-atomic="true"><strong>{updatePending ? '正在更新' : labels[snapshot.phase]}</strong><p>{updatePending ? '請等待更新驗證與安裝完成；啟動器會重新啟動。' : snapshot.detail}</p></div>
           {cleanupFailed || (snapshot.pluginPresent && !snapshot.lazer.running) ? (
             <Button variant="outline" disabled={!bridge?.interactive || busy || settingsPending} onClick={() => void action('launcher_recover')}><RotateCcw size={14} aria-hidden="true" />重試清理</Button>
           ) : running && <Button variant="quiet" disabled={!bridge?.interactive || busy || settingsPending} onClick={() => void action('launcher_stop')}><Square size={13} aria-hidden="true" />關閉遊戲</Button>}

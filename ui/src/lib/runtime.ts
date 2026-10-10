@@ -14,6 +14,22 @@ export interface LauncherSnapshot {
 export interface LauncherSettings { endpoint: string }
 export const defaultEndpoint = 'https://illya.test';
 
+export type UpdateComponent = 'launcher' | 'bridge';
+export interface UpdateStatus {
+  configured: boolean;
+  repository: string | null;
+  currentVersion: string;
+  availableVersion: string | null;
+  downloadBytes: number | null;
+  detail: string;
+  bridgeConfigured: boolean;
+  bridgeRepository: string | null;
+  bridgeVersion: string | null;
+  bridgeAvailableVersion: string | null;
+  bridgeDownloadBytes: number | null;
+  bridgeDetail: string;
+}
+
 export type LauncherCommand = 'launcher_snapshot' | 'launcher_choose_path' | 'launcher_start' | 'launcher_stop' | 'launcher_recover';
 
 export interface LauncherBridge {
@@ -22,6 +38,10 @@ export interface LauncherBridge {
   call(command: LauncherCommand, args?: { client: Client }): Promise<LauncherSnapshot>;
   settings(): Promise<LauncherSettings>;
   saveEndpoint(endpoint: string): Promise<LauncherSettings>;
+  ready(): Promise<void>;
+  updateStatus(): Promise<UpdateStatus>;
+  checkUpdates(): Promise<UpdateStatus>;
+  installUpdate(component: UpdateComponent): Promise<void>;
 }
 
 const phases: Phase[] = ['idle', 'preparing', 'running', 'closing', 'cleaning', 'cleanup_failed', 'error'];
@@ -60,6 +80,42 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
 
+function boundedString(value: unknown, maximum: number): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= maximum;
+}
+
+function nullableVersion(value: unknown): boolean {
+  return value === null || boundedString(value, 128);
+}
+
+function nullableBytes(value: unknown): boolean {
+  return value === null || (typeof value === 'number' && Number.isSafeInteger(value) && value > 0);
+}
+
+function validFeed(configured: unknown, repository: unknown, version: unknown, bytes: unknown): boolean {
+  if (typeof configured !== 'boolean' || !nullableVersion(version) || !nullableBytes(bytes)) return false;
+  if (!configured) return repository === null && version === null && bytes === null;
+  return boundedString(repository, 140) && /^[A-Za-z0-9][A-Za-z0-9-]*\/[A-Za-z0-9_.-]+$/u.test(repository);
+}
+
+export function parseUpdateStatus(value: unknown): UpdateStatus {
+  if (!isRecord(value) || !boundedString(value.currentVersion, 128) || !nullableVersion(value.bridgeVersion)
+    || !boundedString(value.detail, 1000) || !boundedString(value.bridgeDetail, 1000)
+    || !validFeed(value.configured, value.repository, value.availableVersion, value.downloadBytes)
+    || !validFeed(value.bridgeConfigured, value.bridgeRepository, value.bridgeAvailableVersion, value.bridgeDownloadBytes)) {
+    throw new Error('無法讀取更新資訊。請重試讀取。');
+  }
+  return value as unknown as UpdateStatus;
+}
+
+const previewUpdates: UpdateStatus = {
+  configured: false, repository: null, currentVersion: '介面預覽', availableVersion: null,
+  downloadBytes: null, detail: '更新檢查與安裝僅在桌面程式提供。',
+  bridgeConfigured: false, bridgeRepository: null, bridgeVersion: null,
+  bridgeAvailableVersion: null, bridgeDownloadBytes: null,
+  bridgeDetail: '預覽不會下載或更換連線模組。',
+};
+
 function clientState(value: unknown): value is LauncherSnapshot['stable'] {
   return isRecord(value) && (typeof value.path === 'string' || value.path === null) && typeof value.running === 'boolean';
 }
@@ -95,6 +151,10 @@ function previewBridge(): LauncherBridge {
       settings = { endpoint: new URL(endpoint).origin };
       return structuredClone(settings);
     },
+    async updateStatus() { return structuredClone(previewUpdates); },
+    async ready() {},
+    async checkUpdates() { return structuredClone(previewUpdates); },
+    async installUpdate() { throw new Error('請使用桌面版 Kaleidoscope 安裝更新。'); },
     async call(command, args) {
       if (command === 'launcher_snapshot') return structuredClone(snapshot);
       if (!interactive) throw new Error('請使用桌面版 Kaleidoscope 啟動遊戲。');
@@ -132,6 +192,10 @@ export async function createLauncherBridge(): Promise<LauncherBridge> {
     mode: 'native', interactive: true,
     async settings() { return parseSettings(await invoke<unknown>('launcher_settings')); },
     async saveEndpoint(endpoint) { return parseSettings(await invoke<unknown>('launcher_set_endpoint', { endpoint })); },
+    async ready() { await invoke<unknown>('launcher_update_ready'); },
+    async updateStatus() { return parseUpdateStatus(await invoke<unknown>('launcher_update_status')); },
+    async checkUpdates() { return parseUpdateStatus(await invoke<unknown>('launcher_update_check')); },
+    async installUpdate(component) { await invoke<unknown>('launcher_update_install', { component }); },
     async call(command, args) {
       return parseSnapshot(await invoke<unknown>(command, args));
     },

@@ -106,32 +106,27 @@ pub struct PackageBindings {
     pub shared_existing_library: bool,
     pub private_auth_filename: &'static str,
     pub shared_game_preferences: bool,
-    pub supported_assemblies: std::collections::BTreeMap<&'static str, &'static str>,
+    pub supported_assemblies: std::collections::BTreeMap<String, String>,
 }
 
 pub fn inspect_package_bindings() -> Result<PackageBindings> {
-    let hash = option_env!("ILLYA_BRIDGE_SHA256")
-        .ok_or("此啟動器缺少正式連線模組發行雜湊，暫不支援 lazer")?;
     let launcher = canonical_file(&std::env::current_exe().map_err(|error| error.to_string())?)?;
+    let hash = expected_bridge_hash_at_launcher(&launcher)?;
     let bridge = bridge_at_launcher(&launcher)?;
-    verify_bridge_artifact(&bridge, hash)?;
+    verify_bridge_artifact(&bridge, &hash)?;
     Ok(PackageBindings {
         protocol: 1,
         artifact_kind: "cli_connection_test",
         default_endpoint: SERVER,
         endpoint_mode: "https_origin_per_session",
         configurable_endpoint: true,
-        bridge_sha256: hash.to_owned(),
+        bridge_sha256: hash,
         bridge_verified: true,
         official_fallback: false,
         shared_existing_library: true,
         private_auth_filename: "auth.illyaverse.json",
         shared_game_preferences: true,
-        supported_assemblies: std::collections::BTreeMap::from([
-            ("osu.Game.dll", SUPPORTED_GAME_SHA256),
-            ("osu.Framework.dll", SUPPORTED_FRAMEWORK_SHA256),
-            ("osu!.dll", SUPPORTED_ENTRY_SHA256),
-        ]),
+        supported_assemblies: expected_native_assemblies_at_launcher(&launcher)?,
     })
 }
 
@@ -359,6 +354,21 @@ fn refuse_other_lazer_instances() -> Result<()> {
 /// Returns client paths, launcher state and the immutable active session endpoint.
 pub fn snapshot() -> Result<Snapshot> {
     snapshot_at(&Paths::production()?)
+}
+
+/// Updater transitions share the launcher lock. Recheck after waiting for the
+/// visible process to exit, and hold this guard throughout the directory swap.
+pub fn with_idle_update<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    let paths = Paths::production()?;
+    let _lock = ControlLock::open(&paths)?;
+    let state = snapshot_at(&paths)?;
+    if state.stable.running || state.lazer.running || state.plugin_present
+        || state.active_endpoint.is_some()
+        || !matches!(state.phase, Phase::Idle | Phase::Error)
+    {
+        return Err("請先關閉遊戲，並完成連線模組清理後再更新啟動器".into());
+    }
+    operation()
 }
 
 pub fn launcher_settings() -> Result<LauncherSettings> {
@@ -1888,9 +1898,27 @@ fn cleanup_session_ready(paths: &Paths, session: &Session) -> Result<()> {
 }
 
 fn verify_bridge(paths: &Paths) -> Result<(PathBuf, String)> {
-    let hash = option_env!("ILLYA_BRIDGE_SHA256")
-        .ok_or("此啟動器缺少正式連線模組發行雜湊，暫不支援 lazer")?;
-    verify_bridge_with_hash(paths, hash)
+    let hash = expected_bridge_hash_at_launcher(&paths.launcher)?;
+    verify_bridge_with_hash(paths, &hash)
+}
+fn expected_bridge_hash_at_launcher(launcher: &Path) -> Result<String> {
+    let root = launcher.parent().ok_or("啟動器缺少安裝資料夾")?;
+    match super::updater::bridge_feed::expected_bridge_hash(root)? {
+        Some(hash) => Ok(hash),
+        None => option_env!("ILLYA_BRIDGE_SHA256").map(str::to_owned)
+            .ok_or_else(|| "此啟動器缺少正式連線模組發行雜湊，暫不支援 lazer".into()),
+    }
+}
+fn expected_native_assemblies_at_launcher(launcher: &Path) -> Result<std::collections::BTreeMap<String, String>> {
+    let root = launcher.parent().ok_or("啟動器缺少安裝資料夾")?;
+    Ok(match super::updater::bridge_feed::expected_native_assemblies(root)? {
+        Some(assemblies) => assemblies,
+        None => std::collections::BTreeMap::from([
+            ("osu.Game.dll".into(), SUPPORTED_GAME_SHA256.into()),
+            ("osu.Framework.dll".into(), SUPPORTED_FRAMEWORK_SHA256.into()),
+            ("osu!.dll".into(), SUPPORTED_ENTRY_SHA256.into()),
+        ]),
+    })
 }
 fn verify_bridge_with_hash(paths: &Paths, hash: &str) -> Result<(PathBuf, String)> {
     let artifact = paths.bridge()?;
@@ -1910,11 +1938,7 @@ fn verify_bridge_artifact(artifact: &Path, hash: &str) -> Result<()> {
 fn verify_lazer_compatibility(paths: &Paths, selected: &Path) -> Result<()> {
     verify_bridge(paths)?;
     let directory = selected.parent().ok_or("lazer 缺少安裝資料夾")?;
-    for (filename, expected) in [
-        ("osu.Game.dll", SUPPORTED_GAME_SHA256),
-        ("osu.Framework.dll", SUPPORTED_FRAMEWORK_SHA256),
-        ("osu!.dll", SUPPORTED_ENTRY_SHA256),
-    ] {
+    for (filename, expected) in expected_native_assemblies_at_launcher(&paths.launcher)? {
         if artifact_sha256(directory.join(filename))? != expected {
             return Err("這個 lazer 版本尚未通過相容性驗證；不會啟動或切回官方伺服器".into());
         }
@@ -3736,6 +3760,19 @@ mod tests {
         write_json(&fixture.paths.session(), &session).unwrap();
         assert!(read_session(&fixture.paths).is_err());
         assert!(fixture.paths.session().exists());
+    }
+
+    #[test]
+    fn independent_bridge_unsigned_packages_keep_original_native_pins_and_invalid_overrides_fail() {
+        let fixture = Fixture::new();
+        let pins = expected_native_assemblies_at_launcher(&fixture.paths.launcher).unwrap();
+        assert_eq!(pins, std::collections::BTreeMap::from([
+            ("osu.Game.dll".into(), SUPPORTED_GAME_SHA256.into()),
+            ("osu.Framework.dll".into(), SUPPORTED_FRAMEWORK_SHA256.into()),
+            ("osu!.dll".into(), SUPPORTED_ENTRY_SHA256.into()),
+        ]));
+        fs::write(fixture.paths.launcher.parent().unwrap().join("bridge-update.json"), b"invalid signed override").unwrap();
+        assert!(expected_native_assemblies_at_launcher(&fixture.paths.launcher).is_err());
     }
 
     #[test]

@@ -1,0 +1,172 @@
+name: Publish signed Kaleidoscope update
+
+# Building requires the Illyaverse parent workspace and verified installed
+# stock assemblies. This workflow consumes its operator-approved build artifact;
+# it neither downloads nor redistributes an osu! client.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing Kaleidoscope release tag, without the v prefix
+        required: true
+        type: string
+      bridge_version:
+        description: Exact stable Transfiguration version bundled in this launcher build
+        required: true
+        type: string
+      parent_repository:
+        description: Published Illyaverse parent repository (owner/repo)
+        required: true
+        type: string
+      parent_commit:
+        description: Exact 40-character Illyaverse commit used by the build
+        required: true
+        type: string
+      build_run_id:
+        description: Successful parent workflow run containing the verified package
+        required: true
+        type: string
+      artifact_name:
+        description: Artifact containing package/ and package.zip
+        required: true
+        default: kaleidoscope-verified-gui-package
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: kaleidoscope-release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    environment: kaleidoscope-updates
+    timeout-minutes: 20
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      BRIDGE_VERSION: ${{ inputs.bridge_version }}
+      PARENT_REPOSITORY: ${{ inputs.parent_repository }}
+      PARENT_COMMIT: ${{ inputs.parent_commit }}
+      BUILD_RUN_ID: ${{ inputs.build_run_id }}
+      BUILD_ARTIFACT_NAME: ${{ inputs.artifact_name }}
+      KALEIDOSCOPE_UPDATE_REPOSITORY: ${{ vars.KALEIDOSCOPE_UPDATE_REPOSITORY }}
+      KALEIDOSCOPE_UPDATE_PUBLIC_KEY: ${{ vars.KALEIDOSCOPE_UPDATE_PUBLIC_KEY }}
+    steps:
+      - name: Validate channel and immutable build selection
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_REPOSITORY -cne $env:KALEIDOSCOPE_UPDATE_REPOSITORY) { throw 'Update repository is not configured for this channel.' }
+          if (($env:GITHUB_REPOSITORY.Split('/')[1]).ToLowerInvariant() -ne 'kaleidoscope') { throw 'This workflow belongs in the Kaleidoscope repository.' }
+          if ($env:KALEIDOSCOPE_UPDATE_PUBLIC_KEY -cnotmatch '\A[0-9a-f]{64}\z') { throw 'Configure the raw Ed25519 public key.' }
+          if ($env:RELEASE_VERSION -cnotmatch '\A(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\z' -or $env:RELEASE_VERSION.Length -gt 64) { throw 'Use a canonical stable release version.' }
+          if ($env:BRIDGE_VERSION -cnotmatch '\A(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\z' -or $env:BRIDGE_VERSION.Length -gt 64) { throw 'Use the bundled canonical stable bridge version.' }
+          if ($env:PARENT_REPOSITORY -cnotmatch '\A[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}\z') { throw 'Invalid parent repository.' }
+          if ($env:PARENT_COMMIT -cnotmatch '\A[0-9a-f]{40}\z') { throw 'Use an immutable parent commit.' }
+          if ($env:BUILD_RUN_ID -cnotmatch '\A[1-9][0-9]{0,19}\z') { throw 'Invalid build run ID.' }
+          if ($env:BUILD_ARTIFACT_NAME -cnotmatch '\A[A-Za-z0-9][A-Za-z0-9._-]{0,99}\z') { throw 'Invalid artifact name.' }
+
+      - name: Check out the existing Kaleidoscope release tag
+        uses: actions/checkout@v4
+        with:
+          ref: v${{ inputs.version }}
+          path: publisher
+          persist-credentials: false
+
+      - name: Check out its exact Illyaverse parent and siblings
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.parent_repository }}
+          ref: ${{ inputs.parent_commit }}
+          path: parent
+          submodules: recursive
+          persist-credentials: false
+          token: ${{ secrets.ILLYAVERSE_ARTIFACT_READ_TOKEN || github.token }}
+
+      - name: Use Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Validate component pins and run publisher unit tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $releaseCommit = (git -C publisher rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve the Kaleidoscope release commit.' }
+          $parentCommit = (git -C parent rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $parentCommit -cne $env:PARENT_COMMIT) { throw 'Parent checkout does not match the requested commit.' }
+          $componentCommit = (git -C parent/tools/kaleidoscope rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $componentCommit -cne $releaseCommit) { throw 'Parent Kaleidoscope pin differs from the release tag.' }
+          $bridgeCommit = (git -C parent/tools/transfiguration rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $bridgeCommit -cnotmatch '\A[0-9a-f]{40}\z') { throw 'Cannot resolve the Transfiguration pin.' }
+          "KALEIDOSCOPE_COMMIT=$componentCommit" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TRANSFIGURATION_COMMIT=$bridgeCommit" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          node --test parent/tools/kaleidoscope/scripts/create-update-release.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Publisher unit tests failed.' }
+
+      - name: Fetch the selected verified package artifact
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.ILLYAVERSE_ARTIFACT_READ_TOKEN || github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $runText = gh api "repos/$env:PARENT_REPOSITORY/actions/runs/$env:BUILD_RUN_ID"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read the selected parent build run.' }
+          $buildRun = $runText | ConvertFrom-Json
+          if ($buildRun.status -cne 'completed' -or $buildRun.conclusion -cne 'success' -or $buildRun.head_sha -cne $env:PARENT_COMMIT -or $buildRun.head_repository.full_name -cne $env:PARENT_REPOSITORY) { throw 'Build run is not a successful run of the exact parent commit.' }
+          if (Test-Path -LiteralPath incoming) { throw 'Build artifact destination already exists.' }
+          gh run download $env:BUILD_RUN_ID --repo $env:PARENT_REPOSITORY --name $env:BUILD_ARTIFACT_NAME --dir incoming
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot download the selected verified package artifact.' }
+          $names = @(Get-ChildItem -LiteralPath incoming -Force | ForEach-Object { $_.Name })
+          if ($names.Count -ne 2 -or $names -cnotcontains 'package' -or $names -cnotcontains 'package.zip') { throw 'Artifact must contain only package/ and package.zip.' }
+
+      - name: Prepare the signed immutable update assets
+        shell: pwsh
+        env:
+          KALEIDOSCOPE_UPDATE_SIGNING_KEY_PEM: ${{ secrets.KALEIDOSCOPE_UPDATE_SIGNING_KEY_PEM }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node parent/tools/kaleidoscope/scripts/create-update-release.mjs `
+            --version $env:RELEASE_VERSION `
+            --bridge-version $env:BRIDGE_VERSION `
+            --repository $env:KALEIDOSCOPE_UPDATE_REPOSITORY `
+            --workspace-root parent `
+            --package-directory incoming/package `
+            --archive incoming/package.zip `
+            --output-directory update-release `
+            --kaleidoscope-commit $env:KALEIDOSCOPE_COMMIT `
+            --transfiguration-commit $env:TRANSFIGURATION_COMMIT
+          if ($LASTEXITCODE -ne 0) { throw 'The complete package could not be verified and signed.' }
+
+      - name: Publish a new release without replacing existing assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "v$env:RELEASE_VERSION"
+          $existingText = gh api --paginate --slurp "repos/$env:GITHUB_REPOSITORY/releases?per_page=100"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot verify whether this release already exists.' }
+          $releasePages = $existingText | ConvertFrom-Json
+          foreach ($page in $releasePages) {
+            foreach ($release in $page) {
+              if ($release.tag_name -ceq $tag) { throw 'The release already exists; update assets are immutable.' }
+            }
+          }
+          $tagText = gh api "repos/$env:GITHUB_REPOSITORY/git/ref/tags/$tag"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot verify the remote release tag.' }
+          $tagObject = ($tagText | ConvertFrom-Json).object
+          if ($tagObject.type -ceq 'tag') {
+            $annotatedText = gh api "repos/$env:GITHUB_REPOSITORY/git/tags/$($tagObject.sha)"
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot verify the annotated release tag.' }
+            $tagObject = ($annotatedText | ConvertFrom-Json).object
+          }
+          if ($tagObject.type -cne 'commit' -or $tagObject.sha -cne $env:KALEIDOSCOPE_COMMIT) { throw 'Remote release tag no longer matches the verified component pin.' }
+          $archive = "update-release/Kaleidoscope-$env:RELEASE_VERSION-windows-x64.zip"
+          $arguments = @('release', 'create', $tag, 'update-release/updates.json', $archive, '--repo', $env:GITHUB_REPOSITORY, '--verify-tag', '--title', "Kaleidoscope $env:RELEASE_VERSION", '--generate-notes')
+          gh @arguments
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub release publication failed; existing assets were not overwritten.' }

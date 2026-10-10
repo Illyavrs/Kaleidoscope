@@ -5,4 +5,5 @@ pub mod host;
 pub mod install;
 pub mod process;
 pub mod runtime;
+pub mod updater;
 mod storage;
