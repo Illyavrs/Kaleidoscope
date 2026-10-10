@@ -60,6 +60,20 @@ function New-SourceBindingsFixture {
     }
 }
 
+function Test-CompatibilityJson([string]$Text) {
+    & (Get-Module launcher-package) {
+        param($Json)
+        $hash = 'a' * 64
+        $artifact = [ordered]@{
+            protocol = 1; artifact = 'osu.Game.Rulesets.Transfiguration.dll'; sha256 = $hash
+            default_endpoint = 'https://illya.test'; endpoint_mode = 'https_origin_per_session'; configurable_endpoint = $true
+            private_auth_filename = 'auth.illyaverse.json'; shared_game_preferences = $true; fixture = $false
+        }
+        $compatibility = Read-PackageJson $Json 'synthetic compatibility'
+        Assert-BridgePackageMetadata $artifact $compatibility $hash
+    } $Text
+}
+
 try {
     # In-memory JSON exercises the actual private parser/validator. These hashes
     # are fixtures; no package, executable, player settings or network is read.
@@ -93,6 +107,40 @@ try {
     $duplicate = $bindingsText.Replace('"shared_game_preferences": true', '"shared_game_preferences": true, "shared_game_preferences": true')
     Assert-Fixture ($duplicate -cne $bindingsText) 'Duplicate source binding fixture was not created.'
     Expect-Refusal 'source bindings reject duplicate auth policy field' { Test-SourceBindingsJson $duplicate } '*Invalid package JSON*'
+
+    # Exercise metadata validation directly so a changed source-file hash cannot
+    # mask a malformed verification value. All artifact bytes/hashes are fake.
+    $compatibility = Get-Content -LiteralPath (Join-Path $repo 'tools/transfiguration/compatibility.json') -Raw
+    $legacy = $compatibility | ConvertFrom-Json -AsHashtable
+    $legacy.verification.Remove('explicit_ui_current_session_revocation')
+    Assert-Fixture ($legacy.verification.Count -eq 15 -and $legacy.assemblies.Count -eq 5) 'Legacy compatibility fixture changed its verification or assembly boundary.'
+    $legacyText = $legacy | ConvertTo-Json -Depth 20
+    Test-CompatibilityJson $legacyText
+    $checks++
+    Write-Output 'PASS legacy 15-field compatibility verification with original five assembly bindings'
+    $current = $legacyText | ConvertFrom-Json -AsHashtable
+    $current.verification.explicit_ui_current_session_revocation = 'pending_human_test'
+    Assert-Fixture ($current.verification.Count -eq 16) 'Current compatibility fixture did not add exactly one field.'
+    $currentText = $current | ConvertTo-Json -Depth 20
+    Test-CompatibilityJson $currentText
+    $checks++
+    Write-Output 'PASS current 16-field compatibility verification keeps explicit logout pending human test'
+    foreach ($case in @('unknown-field', 'wrong-case-logout', 'logout-passed', 'logout-false', 'logout-true', 'logout-null', 'logout-array', 'verification-boolean', 'verification-array')) {
+        $value = $currentText | ConvertFrom-Json -AsHashtable
+        switch ($case) {
+            'unknown-field' { $value.verification.unknown_policy = 'pending_human_test' }
+            'wrong-case-logout' { $value.verification.Remove('explicit_ui_current_session_revocation'); $value.verification.EXPLICIT_UI_CURRENT_SESSION_REVOCATION = 'pending_human_test' }
+            'logout-passed' { $value.verification.explicit_ui_current_session_revocation = 'passed' }
+            'logout-false' { $value.verification.explicit_ui_current_session_revocation = $false }
+            'logout-true' { $value.verification.explicit_ui_current_session_revocation = $true }
+            'logout-null' { $value.verification.explicit_ui_current_session_revocation = $null }
+            'logout-array' { $value.verification.explicit_ui_current_session_revocation = @('pending_human_test') }
+            'verification-boolean' { $value.verification = $false }
+            'verification-array' { $value.verification = @('pending_human_test') }
+        }
+        $text = $value | ConvertTo-Json -Depth 20
+        Expect-Refusal "compatibility verification rejects $case" { Test-CompatibilityJson $text } '*compatibility.json.verification*'
+    }
     [IO.Directory]::CreateDirectory($fixtureRoot) | Out-Null
     $owner = Join-Path $fixtureRoot '.owner.json'
     $ownerStream = [IO.File]::Open($owner, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
@@ -110,7 +158,6 @@ try {
     foreach ($name in @('DotNet.txt', 'Harmony.txt', 'Iced.txt', 'Mono.Cecil.txt', 'MonoMod.txt')) { Write-Fixture (Join-Path $baseline "bridge/licenses/$name") "synthetic license $name" }
     Write-Fixture (Join-Path $baseline 'ui/THIRD-PARTY-NOTICES.md') 'synthetic GUI font notices'
     foreach ($name in @('Nunito.txt', 'NotoSansTC.txt')) { Write-Fixture (Join-Path $baseline "ui/licenses/$name") "synthetic GUI font license $name" }
-    $compatibility = Get-Content -LiteralPath (Join-Path $repo 'tools/transfiguration/compatibility.json') -Raw
     Write-Fixture (Join-Path $baseline 'bridge/compatibility.json') $compatibility
     Write-Fixture (Join-Path $fixtureRoot 'expected-compatibility.json') $compatibility
     Write-FixtureJson (Join-Path $baseline 'bridge/artifact.json') @{ protocol = 1; artifact = 'osu.Game.Rulesets.Transfiguration.dll'; sha256 = (Get-FileHash -LiteralPath (Join-Path $baseline 'bridge/osu.Game.Rulesets.Transfiguration.dll') -Algorithm SHA256).Hash.ToLowerInvariant(); default_endpoint = 'https://illya.test'; endpoint_mode = 'https_origin_per_session'; configurable_endpoint = $true; private_auth_filename = 'auth.illyaverse.json'; shared_game_preferences = $true; fixture = $false }

@@ -182,6 +182,11 @@ function Assert-BridgePackageMetadata($Artifact, $Compatibility, [string]$Bridge
         private_credential_save_logout_remember_flags = 'passed_headless_native_handlers_worker_intercepted'
         real_api_worker_refresh_and_login = 'pending_human_test'; native_gui_and_login = 'pending_human_test'
     }
+    # Older compatibility receipts predate the explicit logout contract. Accept
+    # its current pending state when present without relaxing any other fields.
+    if ($Compatibility.verification -is [System.Collections.IDictionary] -and @($Compatibility.verification.Keys) -ccontains 'explicit_ui_current_session_revocation') {
+        $verification.explicit_ui_current_session_revocation = 'pending_human_test'
+    }
     Assert-PackageKeys $Compatibility.verification @($verification.Keys) 'compatibility.json.verification'
     foreach ($key in $verification.Keys) { Assert-PackageLiteral $Compatibility.verification[$key] $verification[$key] "compatibility.json.verification.$key" }
 }
