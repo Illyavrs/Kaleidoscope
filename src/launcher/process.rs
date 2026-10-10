@@ -1,5 +1,6 @@
 //! Process ownership is an executable identity plus PID and creation time, never
-//! a process name alone. Production shutdown uses WM_CLOSE and does not force kill.
+//! a process name alone. Production shutdown uses WM_CLOSE (Windows) or SIGTERM
+//! (Linux) and does not force kill.
 
 use crate::Result;
 use serde::{Deserialize, Serialize};
@@ -59,7 +60,7 @@ pub fn executable_identity(path: &Path) -> Result<String> {
     platform::executable_identity(path)
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, unix, test))]
 fn looks_like_lazer(executable: &Path) -> Result<bool> {
     let install = executable
         .parent()
@@ -74,23 +75,184 @@ fn looks_like_lazer(executable: &Path) -> Result<bool> {
     Ok(false)
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, unix)))]
 mod platform {
     use super::*;
     pub(super) fn identity(_pid: u32) -> Result<Option<Identity>> {
-        Err("Native launcher process ownership currently supports Windows only".into())
+        Err("Native launcher process ownership is not supported on this platform".into())
     }
     pub(super) fn find_by_executable(_path: &Path) -> Result<Vec<Identity>> {
-        Err("Native launcher process discovery currently supports Windows only".into())
+        Err("Native launcher process discovery is not supported on this platform".into())
     }
     pub(super) fn find_lazer_candidates() -> Result<Vec<Identity>> {
-        Err("Native launcher process discovery currently supports Windows only".into())
+        Err("Native launcher process discovery is not supported on this platform".into())
     }
     pub(super) fn close_gracefully(_identity: &Identity, _timeout: Duration) -> Result<()> {
-        Err("Native launcher process shutdown currently supports Windows only".into())
+        Err("Native launcher process shutdown is not supported on this platform".into())
     }
     pub(super) fn executable_identity(_path: &Path) -> Result<String> {
-        Err("Native launcher executable ownership currently supports Windows only".into())
+        Err("Native launcher executable ownership is not supported on this platform".into())
+    }
+}
+
+/// Linux ownership uses `/proc`: the start time (clock ticks since boot), the
+/// resolved executable and that file's device and inode.
+#[cfg(unix)]
+mod platform {
+    use super::*;
+    use std::fs;
+    use std::io::ErrorKind;
+    use std::os::unix::fs::MetadataExt;
+    use std::thread;
+
+    fn proc_path(pid: u32, leaf: &str) -> PathBuf {
+        PathBuf::from(format!("/proc/{pid}/{leaf}"))
+    }
+
+    /// Field 22 of `/proc/<pid>/stat`, plus whether the process is a zombie.
+    /// The command name may contain spaces and parentheses, so parse after the last closing one.
+    fn start_time(pid: u32) -> Result<Option<(u64, bool)>> {
+        let text = match fs::read_to_string(proc_path(pid, "stat")) {
+            Ok(text) => text,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(None),
+            Err(_) => return Err("Cannot safely inspect process ownership".into()),
+        };
+        let rest = text
+            .rfind(')')
+            .map(|index| &text[index + 1..])
+            .ok_or("Cannot parse process status")?;
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        // After the command name: state is field 3 and the start time is field 22.
+        let state = fields.first().ok_or("Cannot parse process state")?;
+        let started = fields
+            .get(19)
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or("Cannot parse process start time")?;
+        Ok(Some((started, *state == "Z" || *state == "X")))
+    }
+
+    pub(super) fn identity(pid: u32) -> Result<Option<Identity>> {
+        let Some((started, gone)) = start_time(pid)? else {
+            return Ok(None);
+        };
+        if gone {
+            return Ok(None);
+        }
+        let link = match fs::read_link(proc_path(pid, "exe")) {
+            Ok(link) => link,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err("Cannot inspect process executable path".into()),
+        };
+        if link.to_string_lossy().ends_with(" (deleted)") {
+            return Err("The process executable was replaced or removed".into());
+        }
+        let executable =
+            fs::canonicalize(link).map_err(|_| "Process executable no longer resolves safely")?;
+        let executable_identity = executable_identity(&executable)?;
+        // A second read confirms the PID did not change owner while inspecting it.
+        match start_time(pid)? {
+            Some((again, false)) if again == started => {}
+            _ => return Ok(None),
+        }
+        Ok(Some(Identity {
+            pid,
+            creation_time: started,
+            executable,
+            executable_identity,
+        }))
+    }
+
+    pub(super) fn executable_identity(path: &Path) -> Result<String> {
+        let metadata =
+            fs::symlink_metadata(path).map_err(|_| "Cannot inspect executable identity")?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err("An executable identity requires an ordinary non-linked file".into());
+        }
+        Ok(format!(
+            "unix:{}:{}:{}:{}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime()
+        ))
+    }
+
+    fn process_ids() -> Result<Vec<u32>> {
+        let entries = fs::read_dir("/proc").map_err(|_| "Cannot enumerate client processes")?;
+        Ok(entries
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+            .collect())
+    }
+
+    pub(super) fn find_by_executable(executable: &Path) -> Result<Vec<Identity>> {
+        let expected_path =
+            fs::canonicalize(executable).map_err(|_| "Selected executable does not resolve")?;
+        let expected_id = executable_identity(&expected_path)?;
+        let mut results = Vec::new();
+        for pid in process_ids()? {
+            // Processes owned by other users cannot be our game and are never touched.
+            if let Ok(Some(candidate)) = identity(pid) {
+                if candidate.executable == expected_path
+                    && candidate.executable_identity == expected_id
+                {
+                    results.push(candidate);
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    pub(super) fn find_lazer_candidates() -> Result<Vec<Identity>> {
+        let mut results = Vec::new();
+        for pid in process_ids()? {
+            // Skip other users' processes (unreadable), but report same-user clients
+            // that look like lazer. Nothing here sends a signal.
+            let Ok(Some(candidate)) = identity(pid) else {
+                continue;
+            };
+            if candidate
+                .executable
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some("osu!")
+                && looks_like_lazer(&candidate.executable)?
+            {
+                results.push(candidate);
+            }
+        }
+        Ok(results)
+    }
+
+    pub(super) fn close_gracefully(expected: &Identity, timeout: Duration) -> Result<()> {
+        let Some(actual) = identity(expected.pid)? else {
+            return Ok(());
+        };
+        if actual != *expected {
+            return Err("Process identity changed; no close message was sent".into());
+        }
+        let pid = i32::try_from(expected.pid).map_err(|_| "Invalid process id")?;
+        if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+            return match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::ESRCH) => Ok(()),
+                _ => Err("Cannot send a close request to the selected client".into()),
+            };
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match identity(expected.pid)? {
+                None => return Ok(()),
+                Some(current) if current.creation_time != expected.creation_time => return Ok(()),
+                Some(_) => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(
+                    "The selected client did not close in time; it was not force killed".into(),
+                );
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
@@ -375,7 +537,7 @@ mod platform {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(all(test, any(windows, unix)))]
 mod tests {
     use super::*;
 
@@ -403,7 +565,7 @@ mod tests {
         ));
         std::fs::create_dir(&directory).unwrap();
         let directory = std::fs::canonicalize(directory).unwrap();
-        let executable = directory.join("osu!.exe");
+        let executable = directory.join(if cfg!(windows) { "osu!.exe" } else { "osu!" });
         std::fs::write(&executable, b"fixture, never executed").unwrap();
         assert!(!looks_like_lazer(&executable).unwrap());
         for companion in ["osu!.dll", "osu.Game.dll", "osu.Framework.dll"] {

@@ -15,7 +15,7 @@ impl Failure {
     fn new(code: &'static str) -> Self {
         Self { code, status: None }
     }
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     fn with_status(code: &'static str, status: i32) -> Self {
         Self {
             code,
@@ -36,9 +36,14 @@ impl std::fmt::Display for Failure {
 
 type Result<T> = std::result::Result<T, Failure>;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, unix)))]
 pub fn run_managed(_application: &Path, _hostfxr: &Path, _bridge: &Path) -> Result<i32> {
     Err(Failure::new("host_platform_unsupported"))
+}
+
+#[cfg(unix)]
+pub fn run_managed(application: &Path, hostfxr: &Path, bridge: &Path) -> Result<i32> {
+    unix::run(application, hostfxr, bridge)
 }
 
 #[cfg(windows)]
@@ -169,6 +174,116 @@ mod windows {
         }
         // No fallback branch launches osu!.exe. A missing or throwing startup
         // hook is an application failure and never invokes the original Main.
+        Ok(unsafe { run(context.handle) })
+    }
+}
+
+#[cfg(unix)]
+mod unix {
+    use super::*;
+    use std::ffi::{c_char, c_void, CString};
+    use std::os::unix::ffi::OsStrExt;
+    use std::ptr;
+
+    // hostfxr's `char_t` is a UTF-8 `char` on Unix; the ABI is otherwise the same.
+    type Initialize =
+        unsafe extern "C" fn(i32, *const *const c_char, *const c_void, *mut *mut c_void) -> i32;
+    type SetProperty = unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> i32;
+    type Run = unsafe extern "C" fn(*mut c_void) -> i32;
+    type Close = unsafe extern "C" fn(*mut c_void) -> i32;
+
+    struct Library(*mut c_void);
+    impl Drop for Library {
+        fn drop(&mut self) {
+            unsafe {
+                libc::dlclose(self.0);
+            }
+        }
+    }
+    struct Context {
+        handle: *mut c_void,
+        close: Close,
+    }
+    impl Drop for Context {
+        fn drop(&mut self) {
+            unsafe {
+                (self.close)(self.handle);
+            }
+        }
+    }
+
+    fn c_path(value: &Path) -> Result<CString> {
+        if !value.is_absolute() || !value.is_file() {
+            return Err(Failure::new("host_path_invalid"));
+        }
+        CString::new(value.as_os_str().as_bytes()).map_err(|_| Failure::new("host_path_invalid"))
+    }
+
+    unsafe fn symbol(library: *mut c_void, name: &'static [u8]) -> Result<*mut c_void> {
+        let address = unsafe { libc::dlsym(library, name.as_ptr().cast()) };
+        if address.is_null() {
+            Err(Failure::new("host_api_missing"))
+        } else {
+            Ok(address)
+        }
+    }
+
+    pub(super) fn run(application: &Path, hostfxr: &Path, bridge: &Path) -> Result<i32> {
+        let app_name = c_path(application)?;
+        let library_name = c_path(hostfxr)?;
+        let bridge_name = c_path(bridge)?;
+        let loaded =
+            unsafe { libc::dlopen(library_name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+        if loaded.is_null() {
+            return Err(Failure::new("host_library_load_failed"));
+        }
+        let library = Library(loaded);
+        let initialize: Initialize = unsafe {
+            std::mem::transmute(symbol(
+                library.0,
+                b"hostfxr_initialize_for_dotnet_command_line ",
+            )?)
+        };
+        let set_property: SetProperty = unsafe {
+            std::mem::transmute(symbol(library.0, b"hostfxr_set_runtime_property_value ")?)
+        };
+        let run: Run = unsafe { std::mem::transmute(symbol(library.0, b"hostfxr_run_app ")?) };
+        let close: Close = unsafe { std::mem::transmute(symbol(library.0, b"hostfxr_close ")?) };
+        let args = [app_name.as_ptr()];
+        let mut handle = ptr::null_mut();
+        let result = unsafe { initialize(1, args.as_ptr(), ptr::null(), &mut handle) };
+        // This child must own the first context. Reusing another loaded runtime
+        // would make pre-Main enforcement impossible, so positive statuses fail.
+        if result != 0 || handle.is_null() {
+            if !handle.is_null() {
+                unsafe {
+                    close(handle);
+                }
+            }
+            return Err(Failure::with_status(
+                "host_runtime_initialize_failed",
+                result,
+            ));
+        }
+        let context = Context { handle, close };
+        let support_key =
+            CString::new("System.StartupHookProvider.IsSupported").expect("static key");
+        let enabled = CString::new("true").expect("static value");
+        let hook_key = CString::new("STARTUP_HOOKS").expect("static key");
+        for (key, value) in [
+            (support_key.as_ptr(), enabled.as_ptr()),
+            (hook_key.as_ptr(), bridge_name.as_ptr()),
+        ] {
+            let status = unsafe { set_property(context.handle, key, value) };
+            if status != 0 {
+                return Err(Failure::with_status(
+                    "host_startup_hook_configuration_failed",
+                    status,
+                ));
+            }
+        }
+        // No fallback branch launches the original executable. A missing or
+        // throwing startup hook is an application failure.
         Ok(unsafe { run(context.handle) })
     }
 }

@@ -9,7 +9,9 @@ use crate::Result;
 use fs2::FileExt;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
+#[cfg(windows)]
+use std::io::{Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -18,12 +20,42 @@ use uuid::Uuid;
 
 const SERVER: &str = "https://shdcloud.top";
 // Only stock assemblies independently inspected and tested with the bridge.
+// Each platform ships its own build of the same lazer release.
+#[cfg(windows)]
 const SUPPORTED_GAME_SHA256: &str =
     "ad9527e411111cb4b4045c76df61c3474fd872a04af73160c05d24e44a588249";
+#[cfg(windows)]
 const SUPPORTED_FRAMEWORK_SHA256: &str =
     "93b62f61c72539ed6fdb3c8eba18d276a74de8e1c094280b2531f5a76caea528";
+#[cfg(windows)]
 const SUPPORTED_ENTRY_SHA256: &str =
     "18ae9bb6bb441e9a654ac72c859f527041bde52e5dce4109f8d9074584fa57a4";
+// osulazer 2026.1005.1-tachyon linux-x64 AppImage (usr/bin).
+#[cfg(not(windows))]
+const SUPPORTED_GAME_SHA256: &str =
+    "d2b1b9d93801b22465252ec95a60fd398f6aad6ef117cd5ed9846bc9922bce86";
+#[cfg(not(windows))]
+const SUPPORTED_FRAMEWORK_SHA256: &str =
+    "3d49ca53b034fd93010456d3b7156d9e7fd2dc661181aa61bf55b307ab4d6280";
+#[cfg(not(windows))]
+const SUPPORTED_ENTRY_SHA256: &str =
+    "1a03472241c2b08e62e91bb235ce4bbf7706e611da29b3869f4c9033bdb1afc2";
+#[cfg(windows)]
+const CLIENT_FILENAME: &str = "osu!.exe";
+#[cfg(not(windows))]
+const CLIENT_FILENAME: &str = "osu!";
+#[cfg(windows)]
+const HOSTFXR_FILENAME: &str = "hostfxr.dll";
+#[cfg(not(windows))]
+const HOSTFXR_FILENAME: &str = "libhostfxr.so";
+fn is_client_filename(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    if cfg!(windows) {
+        name.eq_ignore_ascii_case(CLIENT_FILENAME)
+    } else {
+        name == CLIENT_FILENAME
+    }
+}
 const PREFS_FILENAME: &str = "prefs.json";
 const SESSION_FILENAME: &str = "managed-session.json";
 const MAX_RECORD_BYTES: u64 = 16 * 1024;
@@ -78,6 +110,8 @@ pub struct LazerSnapshot {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
+    /// `windows` or `linux`; Linux supports lazer only.
+    pub platform: &'static str,
     pub stable: StableSnapshot,
     pub lazer: LazerSnapshot,
     pub phase: Phase,
@@ -278,6 +312,7 @@ struct Ready {
 #[derive(Clone)]
 struct Paths {
     control: PathBuf,
+    #[cfg_attr(not(windows), allow(dead_code))]
     local: PathBuf,
     roaming: PathBuf,
     legacy_data: PathBuf,
@@ -286,9 +321,9 @@ struct Paths {
 
 impl Paths {
     fn production() -> Result<Self> {
-        #[cfg(not(windows))]
-        return Err("Kaleidoscope 原生啟動器目前僅支援 Windows".into());
-        #[cfg(windows)]
+        #[cfg(not(any(windows, unix)))]
+        return Err("Kaleidoscope 原生啟動器目前僅支援 Windows 與 Linux".into());
+        #[cfg(any(windows, unix))]
         {
             let local = storage::local_app_data()?;
             check_components(&local)?;
@@ -362,7 +397,9 @@ pub fn with_idle_update<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
     let paths = Paths::production()?;
     let _lock = ControlLock::open(&paths)?;
     let state = snapshot_at(&paths)?;
-    if state.stable.running || state.lazer.running || state.plugin_present
+    if state.stable.running
+        || state.lazer.running
+        || state.plugin_present
         || state.active_endpoint.is_some()
         || !matches!(state.phase, Phase::Idle | Phase::Error)
     {
@@ -401,7 +438,16 @@ fn save_endpoint_at(paths: &Paths, endpoint: &str) -> Result<LauncherSettings> {
 /// executable path. Preferences never contain commands or arguments.
 pub fn save_client_path(client: Client, executable: impl AsRef<Path>) -> Result<Snapshot> {
     let paths = Paths::production()?;
-    let executable = validate_client(executable.as_ref(), client)?;
+    // Linux lazer is an AppImage: extract it once and use the extracted `osu!`.
+    #[cfg(unix)]
+    let selected = if client == Client::Lazer && super::appimage::is_appimage(executable.as_ref()) {
+        super::appimage::extract(executable.as_ref(), &paths.control.join("lazer-appimage"))?
+    } else {
+        executable.as_ref().to_path_buf()
+    };
+    #[cfg(not(unix))]
+    let selected = executable.as_ref().to_path_buf();
+    let executable = validate_client(&selected, client)?;
     let _lock = ControlLock::open(&paths)?;
     if let Some(session) = read_session(&paths)? {
         if session_is_live(&session)? {
@@ -465,8 +511,8 @@ fn start_session(paths: &Paths, client: Client) -> Result<String> {
     if client == Client::Stable {
         preferences.endpoint.stable_domain()?;
     }
-    let selected =
-        selected_client_path(paths, &preferences, client).ok_or("請先選擇 osu!.exe 安裝路徑")?;
+    let selected = selected_client_path(paths, &preferences, client)
+        .ok_or_else(|| format!("請先選擇 {CLIENT_FILENAME} 安裝路徑"))?;
     let selected = validate_client(&selected, client)?;
     if client == Client::Lazer {
         verify_lazer_compatibility(paths, &selected)?;
@@ -621,6 +667,7 @@ fn snapshot_at(paths: &Paths) -> Result<Snapshot> {
         None => path_exists(&paths.legacy_data.join("rulesets").join(RULESET_FILENAME))?,
     };
     Ok(Snapshot {
+        platform: if cfg!(windows) { "windows" } else { "linux" },
         stable: StableSnapshot {
             path: stable.as_deref().map(display_path),
             running: selected_running(Client::Stable)?,
@@ -652,6 +699,7 @@ fn snapshot_at(paths: &Paths) -> Result<Snapshot> {
     })
 }
 
+#[cfg_attr(not(windows), allow(unused_variables))]
 fn selected_client_path(
     paths: &Paths,
     preferences: &Preferences,
@@ -665,7 +713,10 @@ fn selected_client_path(
     if client == Client::Stable {
         // Stable's standard per-user installation. Inspect only this executable;
         // discovery neither scans game data nor persists an inferred preference.
+        #[cfg(windows)]
         return validate_client(&paths.local.join("osu!").join("osu!.exe"), client).ok();
+        #[cfg(not(windows))]
+        return None;
     }
     None
 }
@@ -1337,7 +1388,7 @@ fn run_lazer_host(paths: &Paths, nonce: &str) -> Result<i32> {
     };
     match host::run_managed(
         &install.join("osu!.dll"),
-        &install.join("hostfxr.dll"),
+        &install.join(HOSTFXR_FILENAME),
         &bridge,
     ) {
         Ok(code) => Ok(code),
@@ -1463,7 +1514,7 @@ fn read_session(paths: &Paths) -> Result<Option<Session>> {
             || !session
                 .selected_executable
                 .file_name()
-                .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("osu!.exe"))
+                .is_some_and(is_client_filename)
             || session
                 .selected_executable
                 .components()
@@ -1905,20 +1956,28 @@ fn expected_bridge_hash_at_launcher(launcher: &Path) -> Result<String> {
     let root = launcher.parent().ok_or("啟動器缺少安裝資料夾")?;
     match super::updater::bridge_feed::expected_bridge_hash(root)? {
         Some(hash) => Ok(hash),
-        None => option_env!("ILLYA_BRIDGE_SHA256").map(str::to_owned)
+        None => option_env!("ILLYA_BRIDGE_SHA256")
+            .map(str::to_owned)
             .ok_or_else(|| "此啟動器缺少正式連線模組發行雜湊，暫不支援 lazer".into()),
     }
 }
-fn expected_native_assemblies_at_launcher(launcher: &Path) -> Result<std::collections::BTreeMap<String, String>> {
+fn expected_native_assemblies_at_launcher(
+    launcher: &Path,
+) -> Result<std::collections::BTreeMap<String, String>> {
     let root = launcher.parent().ok_or("啟動器缺少安裝資料夾")?;
-    Ok(match super::updater::bridge_feed::expected_native_assemblies(root)? {
-        Some(assemblies) => assemblies,
-        None => std::collections::BTreeMap::from([
-            ("osu.Game.dll".into(), SUPPORTED_GAME_SHA256.into()),
-            ("osu.Framework.dll".into(), SUPPORTED_FRAMEWORK_SHA256.into()),
-            ("osu!.dll".into(), SUPPORTED_ENTRY_SHA256.into()),
-        ]),
-    })
+    Ok(
+        match super::updater::bridge_feed::expected_native_assemblies(root)? {
+            Some(assemblies) => assemblies,
+            None => std::collections::BTreeMap::from([
+                ("osu.Game.dll".into(), SUPPORTED_GAME_SHA256.into()),
+                (
+                    "osu.Framework.dll".into(),
+                    SUPPORTED_FRAMEWORK_SHA256.into(),
+                ),
+                ("osu!.dll".into(), SUPPORTED_ENTRY_SHA256.into()),
+            ]),
+        },
+    )
 }
 fn verify_bridge_with_hash(paths: &Paths, hash: &str) -> Result<(PathBuf, String)> {
     let artifact = paths.bridge()?;
@@ -1947,14 +2006,15 @@ fn verify_lazer_compatibility(paths: &Paths, selected: &Path) -> Result<()> {
 }
 
 fn validate_client(path: &Path, client: Client) -> Result<PathBuf> {
-    let path = canonical_file(path)?;
-    if !path
-        .file_name()
-        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("osu!.exe"))
-    {
-        return Err("請選擇 osu!.exe，而不是其他執行檔或捷徑".into());
+    #[cfg(not(windows))]
+    if client == Client::Stable {
+        return Err("osu!stable 目前只支援 Windows；Linux 請使用 lazer".into());
     }
-    validate_pe(&path, client)?;
+    let path = canonical_file(path)?;
+    if !path.file_name().is_some_and(is_client_filename) {
+        return Err(format!("請選擇 {CLIENT_FILENAME}，而不是其他執行檔或捷徑"));
+    }
+    validate_native_binary(&path, client)?;
     if client == Client::Lazer {
         let directory = path.parent().ok_or("lazer 缺少安裝資料夾")?;
         for filename in [
@@ -1963,16 +2023,41 @@ fn validate_client(path: &Path, client: Client) -> Result<PathBuf> {
             "osu!.runtimeconfig.json",
             "osu.Game.dll",
             "osu.Framework.dll",
-            "hostfxr.dll",
+            HOSTFXR_FILENAME,
         ] {
             canonical_file(&directory.join(filename))
                 .map_err(|_| format!("lazer 安裝資料夾缺少安全可讀取的 {filename}"))?;
         }
-        validate_pe(&directory.join("hostfxr.dll"), Client::Lazer)?;
+        validate_native_binary(&directory.join(HOSTFXR_FILENAME), Client::Lazer)?;
     }
     Ok(path)
 }
 
+#[cfg(windows)]
+fn validate_native_binary(path: &Path, client: Client) -> Result<()> {
+    validate_pe(path, client)
+}
+
+/// Linux lazer ships as 64-bit x86 ELF files: the `osu!` apphost and `libhostfxr.so`.
+#[cfg(not(windows))]
+fn validate_native_binary(path: &Path, _client: Client) -> Result<()> {
+    let mut file = File::open(path).map_err(|_| "無法讀取遊戲 ELF 標頭")?;
+    let mut header = [0u8; 20];
+    file.read_exact(&mut header)
+        .map_err(|_| "執行檔缺少 ELF 標頭")?;
+    let kind = u16::from_le_bytes([header[16], header[17]]);
+    let machine = u16::from_le_bytes([header[18], header[19]]);
+    if &header[..4] != b"\x7fELF" {
+        return Err("選擇的檔案不是 Linux ELF 執行檔".into());
+    }
+    // 64-bit, little-endian, x86-64; executable or position-independent/shared object.
+    if header[4] != 2 || header[5] != 1 || machine != 0x3e || !matches!(kind, 2 | 3) {
+        return Err("目前啟動器需要 x64 的 Linux lazer 執行檔".into());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 fn validate_pe(path: &Path, client: Client) -> Result<()> {
     let mut file = File::open(path).map_err(|_| "無法讀取遊戲 PE 標頭")?;
     let mut dos = [0u8; 64];
@@ -2025,6 +2110,11 @@ fn hidden_child(command: &mut Command) {
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000); // CREATE_NO_WINDOW; independent process lifetime.
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0); // Independent lifetime: terminal signals do not reach it.
     }
 }
 
@@ -2276,8 +2366,8 @@ mod tests {
             fs::write(&launcher, b"launcher identity fixture").unwrap();
             let client_root = directory.join("game");
             fs::create_dir(&client_root).unwrap();
-            let client = client_root.join("osu!.exe");
-            write_pe(&client, 0x8664);
+            let client = client_root.join(CLIENT_FILENAME);
+            write_native_binary(&client);
             let paths = Paths {
                 control,
                 local: directory.join("local"),
@@ -2316,7 +2406,7 @@ mod tests {
             for filename in ["osu!.deps.json", "osu!.runtimeconfig.json"] {
                 fs::write(root.join(filename), b"{}").unwrap();
             }
-            write_pe(&root.join("hostfxr.dll"), 0x8664);
+            write_native_binary(&root.join(HOSTFXR_FILENAME));
         }
         #[cfg(windows)]
         fn live_paths(&self) -> Paths {
@@ -2362,6 +2452,26 @@ mod tests {
             fs::remove_dir_all(directory).unwrap();
         }
     }
+    #[cfg(windows)]
+    fn write_native_binary(path: &Path) {
+        write_pe(path, 0x8664);
+    }
+    #[cfg(not(windows))]
+    fn write_native_binary(path: &Path) {
+        write_elf(path, 2, 0x3e);
+    }
+    /// A 64-byte ELF header: class 2 is 64-bit, little-endian, type DYN, selected machine.
+    #[cfg(not(windows))]
+    fn write_elf(path: &Path, class: u8, machine: u16) {
+        let mut bytes = [0u8; 64];
+        bytes[..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = class;
+        bytes[5] = 1;
+        bytes[16..18].copy_from_slice(&3u16.to_le_bytes());
+        bytes[18..20].copy_from_slice(&machine.to_le_bytes());
+        fs::write(path, bytes).unwrap();
+    }
+    #[cfg(windows)]
     fn write_pe(path: &Path, machine: u16) {
         let mut bytes = [0u8; 128];
         bytes[..2].copy_from_slice(b"MZ");
@@ -2378,6 +2488,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(snapshot).unwrap(),
             json!({
+                "platform":if cfg!(windows) { "windows" } else { "linux" },
                 "stable":{"path":null,"running":false},
                 "lazer":{"path":null,"running":false,"compatibility":"unknown"},
                 "phase":"idle","detail":"未找到 stable 預設安裝位置，請選擇遊戲安裝路徑。","pluginPresent":false,"activeEndpoint":null
@@ -2396,6 +2507,7 @@ mod tests {
         assert!(handle_internal(&["help".into()]).is_none());
     }
 
+    #[cfg(windows)]
     #[test]
     fn stable_discovery_populates_snapshot_without_creating_preferences() {
         let fixture = Fixture::new();
@@ -2422,6 +2534,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn stable_discovery_preserves_explicit_selection_even_when_it_is_missing() {
         let fixture = Fixture::new();
@@ -2449,6 +2562,7 @@ mod tests {
         assert!(!fixture.paths.session().exists());
     }
 
+    #[cfg(windows)]
     #[test]
     fn stable_discovery_ignores_absent_directory_and_invalid_executables() {
         let fixture = Fixture::new();
@@ -3766,15 +3880,54 @@ mod tests {
     fn independent_bridge_unsigned_packages_keep_original_native_pins_and_invalid_overrides_fail() {
         let fixture = Fixture::new();
         let pins = expected_native_assemblies_at_launcher(&fixture.paths.launcher).unwrap();
-        assert_eq!(pins, std::collections::BTreeMap::from([
-            ("osu.Game.dll".into(), SUPPORTED_GAME_SHA256.into()),
-            ("osu.Framework.dll".into(), SUPPORTED_FRAMEWORK_SHA256.into()),
-            ("osu!.dll".into(), SUPPORTED_ENTRY_SHA256.into()),
-        ]));
-        fs::write(fixture.paths.launcher.parent().unwrap().join("bridge-update.json"), b"invalid signed override").unwrap();
+        assert_eq!(
+            pins,
+            std::collections::BTreeMap::from([
+                ("osu.Game.dll".into(), SUPPORTED_GAME_SHA256.into()),
+                (
+                    "osu.Framework.dll".into(),
+                    SUPPORTED_FRAMEWORK_SHA256.into()
+                ),
+                ("osu!.dll".into(), SUPPORTED_ENTRY_SHA256.into()),
+            ])
+        );
+        fs::write(
+            fixture
+                .paths
+                .launcher
+                .parent()
+                .unwrap()
+                .join("bridge-update.json"),
+            b"invalid signed override",
+        )
+        .unwrap();
         assert!(expected_native_assemblies_at_launcher(&fixture.paths.launcher).is_err());
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn executable_elf_layout_and_release_hash_are_required() {
+        let fixture = Fixture::new();
+        // Linux supports lazer only, and only with the complete installation layout.
+        assert!(validate_client(&fixture.client, Client::Lazer).is_err());
+        assert!(validate_client(&fixture.client, Client::Stable).is_err());
+        fixture.layout();
+        validate_client(&fixture.client, Client::Lazer).unwrap();
+        let (bridge, hash) = fixture.bridge();
+        verify_bridge_with_hash(&fixture.paths, &hash).unwrap();
+        assert!(verify_bridge_with_hash(&fixture.paths, &"0".repeat(64)).is_err());
+        assert!(verify_lazer_compatibility(&fixture.paths, &fixture.client).is_err());
+        fs::write(&bridge, b"tampered bridge").unwrap();
+        assert!(verify_bridge_with_hash(&fixture.paths, &hash).is_err());
+        write_elf(&fixture.client, 1, 0x3e); // 32-bit
+        assert!(validate_client(&fixture.client, Client::Lazer).is_err());
+        write_elf(&fixture.client, 2, 0xb7); // aarch64
+        assert!(validate_client(&fixture.client, Client::Lazer).is_err());
+        fs::write(&fixture.client, b"not ELF").unwrap();
+        assert!(validate_client(&fixture.client, Client::Lazer).is_err());
+    }
+
+    #[cfg(windows)]
     #[test]
     fn executable_pe_architecture_layout_and_release_hash_are_required() {
         let fixture = Fixture::new();

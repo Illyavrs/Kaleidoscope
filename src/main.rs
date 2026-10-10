@@ -366,6 +366,7 @@ mod tests {
             Compatibility, LazerSnapshot, Phase, Snapshot, StableSnapshot,
         };
         let mut snapshot = Snapshot {
+            platform: "windows",
             stable: StableSnapshot {
                 path: None,
                 running: true,

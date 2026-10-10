@@ -26,6 +26,37 @@ pub(super) fn local_app_data() -> Result<PathBuf> {
     ))
 }
 
+/// .NET maps both application-data folders to XDG_DATA_HOME on Linux
+/// ($HOME/.local/share by default). Resolve symlinked home directories first so
+/// the later no-symlink component checks see the real path. Nothing is created.
+#[cfg(unix)]
+fn data_home() -> Result<PathBuf> {
+    let base = match std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        Some(path) => path,
+        None => {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .ok_or("找不到使用者資料夾")?;
+            home.join(".local/share")
+        }
+    };
+    fs::canonicalize(base).map_err(|_| "找不到使用者資料夾".into())
+}
+
+#[cfg(unix)]
+pub(super) fn roaming_app_data() -> Result<PathBuf> {
+    data_home()
+}
+
+#[cfg(unix)]
+pub(super) fn local_app_data() -> Result<PathBuf> {
+    data_home()
+}
+
 #[cfg(windows)]
 fn known_folder(identifier: windows_sys::core::GUID) -> Result<PathBuf> {
     use std::ffi::{c_void, OsString};

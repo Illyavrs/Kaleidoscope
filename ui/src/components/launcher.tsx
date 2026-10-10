@@ -22,11 +22,13 @@ function ClientRow({ client, snapshot, endpoint, disabled, run, choose }: {
   const customStablePort = client === 'stable' && endpoint && Boolean(new URL(endpoint).port);
   const blocked = customStablePort || (client === 'lazer' && (snapshot.lazer.compatibility !== 'supported'
     || (snapshot.pluginPresent && !snapshot.lazer.running)));
+  const linux = snapshot.platform === 'linux';
   const hint = customStablePort ? '目前網址使用自訂連接埠；stable 需要 HTTPS 443。'
     : client === 'stable' ? state.path ? '以 devserver 參數連到設定的伺服器。' : '未找到預設安裝位置，請選擇 osu!.exe。'
     : snapshot.lazer.compatibility === 'unsupported' ? '此版本暫不支援，請等待啟動器與連線 ruleset 配套更新。'
       : snapshot.lazer.compatibility === 'unknown' && state.path ? '正在確認此版本的相容性。'
-        : '啟動前放入連線 ruleset，關閉後自動清理。';
+        : linux && !state.path ? '選擇 osu.AppImage，或解壓縮後的 osu!。'
+          : '啟動前放入連線 ruleset，關閉後自動清理。';
 
   return (
     <section className="client-row" aria-labelledby={`${client}-title`} data-client={client}>
@@ -200,14 +202,14 @@ export function Launcher() {
   return (
     <main className="launcher-shell">
       <header className="launcher-header">
-        <div><h1>Kaleidoscope</h1><p>stable 與 lazer 連線啟動器。</p></div>
+        <div><h1>Kaleidoscope</h1><p>{snapshot.platform === 'linux' ? 'lazer 連線啟動器。' : 'stable 與 lazer 連線啟動器。'}</p></div>
         <span className="brand-name">Illyaverse</span>
       </header>
       {bridge?.mode === 'preview' && <div className="preview-note"><CircleHelp size={15} aria-hidden="true" />介面預覽 · {bridge.interactive ? '按鈕僅模擬狀態，不會啟動遊戲' : '啟動功能僅在桌面程式提供'}</div>}
       <div className="launcher-panel">
         <ServerSettings settings={settings} activeEndpoint={snapshot.activeEndpoint} interactive={Boolean(bridge?.interactive)} busy={settingsPending} operationBusy={busy}
           loadError={settingsError} retry={() => void retrySettings()} save={saveEndpoint} />
-        <ClientRow client="stable" snapshot={snapshot} endpoint={settings?.endpoint ?? null} disabled={blocked} choose={() => void action('launcher_choose_path', 'stable')} run={() => void action('launcher_start', 'stable')} />
+        {snapshot.platform !== 'linux' && <ClientRow client="stable" snapshot={snapshot} endpoint={settings?.endpoint ?? null} disabled={blocked} choose={() => void action('launcher_choose_path', 'stable')} run={() => void action('launcher_start', 'stable')} />}
         <ClientRow client="lazer" snapshot={snapshot} endpoint={settings?.endpoint ?? null} disabled={blocked} choose={() => void action('launcher_choose_path', 'lazer')} run={() => void action('launcher_start', 'lazer')} />
         <Updates bridge={bridge} installBlocked={busy || settingsPending || running || snapshot.pluginPresent || snapshot.phase !== 'idle'} beginInstall={beginUpdate} endInstall={endUpdate} />
       </div>

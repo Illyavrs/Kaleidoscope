@@ -3,6 +3,8 @@ export type Phase = 'idle' | 'preparing' | 'running' | 'closing' | 'cleaning' | 
 export type Compatibility = 'unknown' | 'supported' | 'unsupported';
 
 export interface LauncherSnapshot {
+  /** Linux supports lazer only; older native builds omit the field (Windows). */
+  platform?: 'windows' | 'linux';
   stable: { path: string | null; running: boolean };
   lazer: { path: string | null; running: boolean; compatibility: Compatibility };
   phase: Phase;

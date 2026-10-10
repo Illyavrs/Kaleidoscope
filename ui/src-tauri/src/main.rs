@@ -27,11 +27,12 @@ async fn launcher_set_endpoint(endpoint: String) -> Result<LauncherSettings, Str
 #[tauri::command]
 async fn launcher_choose_path(app: tauri::AppHandle, client: Client) -> Result<Snapshot, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let selected = app
-            .dialog()
-            .file()
-            .add_filter("osu! client", &["exe"])
-            .blocking_pick_file();
+        // Windows clients are `osu!.exe`; the Linux client has no extension, so no filter there.
+        #[cfg(windows)]
+        let picker = app.dialog().file().add_filter("osu! client", &["exe"]);
+        #[cfg(not(windows))]
+        let picker = app.dialog().file();
+        let selected = picker.blocking_pick_file();
         match selected {
             Some(file) => runtime::save_client_path(
                 client,
