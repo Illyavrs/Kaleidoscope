@@ -121,6 +121,8 @@ jobs:
           KALEIDOSCOPE_UPDATE_VERSION: ${{ env.RELEASE_VERSION }}
         run: |
           $ErrorActionPreference = 'Stop'
+          # The packager requires its output parent to exist before it starts.
+          New-Item -ItemType Directory -Path .artifacts/release -Force | Out-Null
           ./tools/kaleidoscope/scripts/package-launcher.ps1 -BuildProfile Release -BridgeDirectory .artifacts/bridge -OutputDirectory (Join-Path $pwd '.artifacts/release/package')
           if ($LASTEXITCODE -ne 0) { throw 'Launcher packaging failed.' }
           ./tools/kaleidoscope/scripts/verify-launcher-package.ps1 -Directory .artifacts/release/package
