@@ -27,7 +27,7 @@ All commands preview by default. Only apply/restore with --write modify a file.\
 Hosts/profile commands do not install certificates, change DNS caches, or launch clients.\n\
 System hosts writes need administrator/root permissions. Close other hosts editors first.\n\
 --expect-current requires hosts to match an earlier byte snapshot before applying the plan.\n\
-See docs/connection.md for TLS and client compatibility requirements.";
+See the operator docs (Connecting players) for TLS and client compatibility requirements.";
 
 #[derive(Debug)]
 struct Args {
@@ -146,7 +146,7 @@ fn run(args: Args) -> Result<()> {
                 for host in stable_domains(&domain)? {
                     println!("{host}");
                 }
-                println!("\nClient version and server routes still need a real login/score/replay test. See docs/connection.md.");
+                println!("\nClient version and server routes still need a real login/score/replay test. See the operator docs (Connecting players).");
             } else {
                 for prefix in ["osu", "spectator", "bss"] {
                     validate_domain(&format!("{prefix}.{domain}"))?;
