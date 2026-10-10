@@ -2,13 +2,16 @@ param(
     [string]$NativeRoot = (Join-Path $env:LOCALAPPDATA 'osulazer/current'),
     [string]$OutputDirectory,
     [ValidateSet('Release', 'Debug')][string]$BuildProfile = 'Release',
-    [string]$TargetDirectory
+    [string]$TargetDirectory,
+    # Use an already built, verified Transfiguration release directory instead of
+    # compiling the bridge from an installed lazer (hosted CI has no native client).
+    [string]$BridgeDirectory
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 Import-Module (Join-Path $PSScriptRoot 'launcher-package.psm1') -Force
 $repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '../../..')).Path
-$native = (Resolve-Path -LiteralPath $NativeRoot).Path
+if (!$BridgeDirectory) { $native = (Resolve-Path -LiteralPath $NativeRoot).Path }
 if (!$OutputDirectory) {
     $OutputDirectory = Join-Path $repo ('data-kaleidoscope-package-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N'))
 }
@@ -16,8 +19,10 @@ $output = Assert-PackageWorkspacePath $OutputDirectory $repo
 $cargoTarget = Resolve-KaleidoscopeCargoTarget -WorkspaceRoot $repo -TargetDirectory $TargetDirectory
 if ((Test-Path -LiteralPath $output) -or (Test-Path -LiteralPath ($output + '.zip'))) { throw 'Package output or ZIP already exists; choose a new output directory.' }
 if (!(Test-Path -LiteralPath ([IO.Path]::GetDirectoryName($output)) -PathType Container)) { throw 'Package parent directory must already exist.' }
-foreach ($required in @('osu.Game.dll','osu.Framework.dll','osu!.dll','hostfxr.dll')) {
-    if (!(Test-Path -LiteralPath (Join-Path $native $required) -PathType Leaf)) { throw "Selected lazer installation is missing $required" }
+if (!$BridgeDirectory) {
+    foreach ($required in @('osu.Game.dll','osu.Framework.dll','osu!.dll','hostfxr.dll')) {
+        if (!(Test-Path -LiteralPath (Join-Path $native $required) -PathType Leaf)) { throw "Selected lazer installation is missing $required" }
+    }
 }
 $previousHash = [Environment]::GetEnvironmentVariable('ILLYA_BRIDGE_SHA256', 'Process')
 $previousIncremental = [Environment]::GetEnvironmentVariable('CARGO_INCREMENTAL', 'Process')
@@ -30,8 +35,15 @@ try {
     $env:CARGO_INCREMENTAL = '0'
     $env:CARGO_TARGET_DIR = $cargoTarget
     $bridgeOutput = Join-Path $repo 'tools/transfiguration/artifacts'
-    & ./tools/transfiguration/build.ps1 -NativeRoot $native
-    Assert-Build 'Original connection bridge build'
+    if ($BridgeDirectory) {
+        $bridgeOutput = (Resolve-Path -LiteralPath $BridgeDirectory).Path
+        foreach ($required in @('osu.Game.Rulesets.Transfiguration.dll', 'artifact.json', 'compatibility.json', 'THIRD-PARTY-NOTICES.md', 'README.md')) {
+            if (!(Test-Path -LiteralPath (Join-Path $bridgeOutput $required) -PathType Leaf)) { throw "Prebuilt bridge directory is missing $required" }
+        }
+    } else {
+        & ./tools/transfiguration/build.ps1 -NativeRoot $native
+        Assert-Build 'Original connection bridge build'
+    }
     $bridge = Join-Path $bridgeOutput 'osu.Game.Rulesets.Transfiguration.dll'
     $env:ILLYA_BRIDGE_SHA256 = (Get-FileHash -LiteralPath $bridge -Algorithm SHA256).Hash.ToLowerInvariant()
     $bridgeManifest = Get-Content -LiteralPath (Join-Path $bridgeOutput 'artifact.json') -Raw | ConvertFrom-Json
