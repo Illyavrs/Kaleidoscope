@@ -30,7 +30,7 @@ const compatibility: Compatibility[] = ['unknown', 'supported', 'unsupported'];
 export const emptySnapshot: LauncherSnapshot = {
   stable: { path: null, running: false },
   lazer: { path: null, running: false, compatibility: 'unknown' },
-  phase: 'idle', detail: '選擇遊戲的安裝位置，即可準備啟動。', pluginPresent: false, activeEndpoint: null,
+  phase: 'idle', detail: '正在確認遊戲安裝位置。', pluginPresent: false, activeEndpoint: null,
 };
 
 // These checks give immediate form feedback; native validation remains authoritative.
@@ -83,6 +83,7 @@ export function parseSnapshot(value: unknown): LauncherSnapshot {
 function previewBridge(): LauncherBridge {
   const interactive = process.env.NODE_ENV === 'development';
   let snapshot = structuredClone(emptySnapshot);
+  snapshot.detail = '選擇遊戲的安裝位置，即可準備啟動（預覽狀態）。';
   let settings = { endpoint: defaultEndpoint };
   return {
     mode: 'preview', interactive,

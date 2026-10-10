@@ -106,6 +106,30 @@ test('native bridge shows ready and running states with a configured server and 
   ]);
 });
 
+test('native detected stable path can launch directly without opening a chooser', async ({ page }) => {
+  const installed = 'C:\\Users\\Player\\AppData\\Local\\osu!\\osu!.exe';
+  await mockNative(page, { ...ready, stable: { path: installed, running: false } });
+  await page.goto('/');
+  await expect(page.getByRole('textbox', { name: 'stable 安裝位置' })).toHaveValue(installed);
+  await expect(page.locator('[data-client="stable"]').getByText('變更位置', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: '啟動 stable', exact: true }).click();
+  await expect(page.getByRole('button', { name: '關閉並重新啟動 stable' })).toBeEnabled();
+  const commands = await page.evaluate(() => (window as unknown as { __launcherTestCommands: { command: string; args?: { client: string } }[] }).__launcherTestCommands);
+  expect(commands.filter((entry) => entry.command === 'launcher_choose_path')).toEqual([]);
+  expect(commands.filter((entry) => entry.command === 'launcher_start')).toEqual([
+    { command: 'launcher_start', args: { client: 'stable' } },
+  ]);
+});
+
+test('missing stable installation requests manual selection and keeps launching disabled', async ({ page }) => {
+  await mockNative(page, { ...ready, stable: { path: null, running: false } });
+  await page.goto('/');
+  await expect(page.getByRole('textbox', { name: 'stable 安裝位置' })).toHaveValue('');
+  await expect(page.getByText('未找到預設安裝位置，請選擇 osu!.exe。')).toBeVisible();
+  await expect(page.getByRole('button', { name: '啟動 stable', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: '選擇 stable 安裝位置' })).toBeEnabled();
+});
+
 test('unsupported lazer and failed cleanup block launching while cleanup remains recoverable', async ({ page }) => {
   await mockNative(page, { ...ready, phase: 'cleanup_failed', pluginPresent: true, detail: '連線 ruleset 無法刪除。請關閉 lazer 後重試清理。' });
   await page.setViewportSize({ width: 720, height: 640 });

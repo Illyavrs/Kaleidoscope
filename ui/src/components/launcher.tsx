@@ -22,7 +22,7 @@ function ClientRow({ client, snapshot, endpoint, disabled, run, choose }: {
   const blocked = customStablePort || (client === 'lazer' && (snapshot.lazer.compatibility !== 'supported'
     || (snapshot.pluginPresent && !snapshot.lazer.running)));
   const hint = customStablePort ? '目前網址使用自訂連接埠；stable 需要 HTTPS 443。'
-    : client === 'stable' ? '以 devserver 參數連到設定的伺服器。'
+    : client === 'stable' ? state.path ? '以 devserver 參數連到設定的伺服器。' : '未找到預設安裝位置，請選擇 osu!.exe。'
     : snapshot.lazer.compatibility === 'unsupported' ? '此版本暫不支援，請等待啟動器與連線 ruleset 配套更新。'
       : snapshot.lazer.compatibility === 'unknown' && state.path ? '正在確認此版本的相容性。'
         : '啟動前放入連線 ruleset，關閉後自動清理。';
@@ -37,9 +37,9 @@ function ClientRow({ client, snapshot, endpoint, disabled, run, choose }: {
       </div>
       <div className="path-row">
         <label className="sr-only" htmlFor={`${client}-path`}>{client} 安裝位置</label>
-        <input id={`${client}-path`} readOnly value={state.path ?? ''} placeholder="尚未選擇安裝位置" title={state.path ?? ''} spellCheck={false} />
+        <input id={`${client}-path`} readOnly value={state.path ?? ''} placeholder={client === 'stable' ? '未偵測到安裝位置' : '尚未選擇安裝位置'} title={state.path ?? ''} spellCheck={false} />
         <Button variant="outline" onClick={choose} disabled={disabled} aria-label={`選擇 ${client} 安裝位置`}>
-          <FolderOpen size={15} aria-hidden="true" /><span>選擇位置</span>
+          <FolderOpen size={15} aria-hidden="true" /><span>{state.path ? '變更位置' : '選擇位置'}</span>
         </Button>
       </div>
       <div className="client-action">

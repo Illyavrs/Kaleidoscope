@@ -283,6 +283,7 @@ struct Ready {
 #[derive(Clone)]
 struct Paths {
     control: PathBuf,
+    local: PathBuf,
     roaming: PathBuf,
     legacy_data: PathBuf,
     launcher: PathBuf,
@@ -307,6 +308,7 @@ impl Paths {
                 canonical_file(&std::env::current_exe().map_err(|error| error.to_string())?)?;
             Ok(Self {
                 control,
+                local,
                 roaming,
                 legacy_data,
                 launcher,
@@ -453,10 +455,9 @@ fn start_session(paths: &Paths, client: Client) -> Result<String> {
     if client == Client::Stable {
         preferences.endpoint.stable_domain()?;
     }
-    let selected = preferences
-        .path(client)
-        .ok_or("請先選擇 osu!.exe 安裝路徑")?;
-    let selected = validate_client(selected, client)?;
+    let selected =
+        selected_client_path(paths, &preferences, client).ok_or("請先選擇 osu!.exe 安裝路徑")?;
+    let selected = validate_client(&selected, client)?;
     if client == Client::Lazer {
         verify_lazer_compatibility(paths, &selected)?;
     }
@@ -562,9 +563,14 @@ pub fn handle_internal(arguments: &[String]) -> Option<Result<i32>> {
 
 fn snapshot_at(paths: &Paths) -> Result<Snapshot> {
     let preferences = read_preferences(paths)?;
+    let stable = selected_client_path(paths, &preferences, Client::Stable);
     let session = read_session(paths)?;
     let selected_running = |client: Client| -> Result<bool> {
-        if let Some(path) = preferences.path(client) {
+        let path = match client {
+            Client::Stable => stable.as_deref(),
+            Client::Lazer => preferences.lazer.as_deref(),
+        };
+        if let Some(path) = path {
             if path.exists() && !process::find_by_executable(path)?.is_empty() {
                 return Ok(true);
             }
@@ -606,7 +612,7 @@ fn snapshot_at(paths: &Paths) -> Result<Snapshot> {
     };
     Ok(Snapshot {
         stable: StableSnapshot {
-            path: preferences.stable.as_deref().map(display_path),
+            path: stable.as_deref().map(display_path),
             running: selected_running(Client::Stable)?,
         },
         lazer: LazerSnapshot {
@@ -621,13 +627,37 @@ fn snapshot_at(paths: &Paths) -> Result<Snapshot> {
         detail: session
             .as_ref()
             .map(|session| session.detail.clone())
-            .unwrap_or_else(|| "選擇遊戲安裝路徑以連線至 Illyaverse".into()),
+            .unwrap_or_else(|| {
+                if stable.is_some() || preferences.lazer.is_some() {
+                    "遊戲位置已確認，可以啟動。".into()
+                } else {
+                    "未找到 stable 預設安裝位置，請選擇遊戲安裝路徑。".into()
+                }
+            }),
         plugin_present,
         active_endpoint: session
             .as_ref()
             .filter(|record| !session_completed(record))
             .map(|record| record.endpoint().as_str().to_owned()),
     })
+}
+
+fn selected_client_path(
+    paths: &Paths,
+    preferences: &Preferences,
+    client: Client,
+) -> Option<PathBuf> {
+    if let Some(selected) = preferences.path(client) {
+        // An explicit selection remains authoritative, including when its
+        // installation has moved. Never silently switch to a different client.
+        return Some(selected.to_path_buf());
+    }
+    if client == Client::Stable {
+        // Stable's standard per-user installation. Inspect only this executable;
+        // discovery neither scans game data nor persists an inferred preference.
+        return validate_client(&paths.local.join("osu!").join("osu!.exe"), client).ok();
+    }
+    None
 }
 
 fn stop_at(paths: &Paths) -> Result<()> {
@@ -2226,12 +2256,14 @@ mod tests {
             write_pe(&client, 0x8664);
             let paths = Paths {
                 control,
+                local: directory.join("local"),
                 roaming: directory.join("roaming"),
                 legacy_data: directory.join("private-lazer"),
                 launcher,
             };
             fs::create_dir(&paths.roaming).unwrap();
             fs::create_dir(paths.roaming.join("osu")).unwrap();
+            fs::create_dir(&paths.local).unwrap();
             Self {
                 directory,
                 paths,
@@ -2324,7 +2356,7 @@ mod tests {
             json!({
                 "stable":{"path":null,"running":false},
                 "lazer":{"path":null,"running":false,"compatibility":"unknown"},
-                "phase":"idle","detail":"選擇遊戲安裝路徑以連線至 Illyaverse","pluginPresent":false,"activeEndpoint":null
+                "phase":"idle","detail":"未找到 stable 預設安裝位置，請選擇遊戲安裝路徑。","pluginPresent":false,"activeEndpoint":null
             })
         );
         assert_eq!(
@@ -2338,6 +2370,79 @@ mod tests {
                 .is_err()
         );
         assert!(handle_internal(&["help".into()]).is_none());
+    }
+
+    #[test]
+    fn stable_discovery_populates_snapshot_without_creating_preferences() {
+        let fixture = Fixture::new();
+        let installed = fixture.paths.local.join("osu!");
+        fs::create_dir(&installed).unwrap();
+        let executable = installed.join("osu!.exe");
+        write_pe(&executable, 0x14c);
+        let unrelated = installed.join("osu!.fixture.cfg");
+        fs::write(&unrelated, b"unrelated game preferences fixture").unwrap();
+
+        let snapshot = snapshot_at(&fixture.paths).unwrap();
+        assert_eq!(
+            snapshot.stable.path,
+            Some(display_path(&fs::canonicalize(&executable).unwrap()))
+        );
+        assert!(!snapshot.stable.running);
+        assert_eq!(snapshot.detail, "遊戲位置已確認，可以啟動。");
+        assert!(snapshot.lazer.path.is_none());
+        assert!(!fixture.paths.prefs().exists());
+        assert!(!fixture.paths.session().exists());
+        assert_eq!(
+            fs::read(unrelated).unwrap(),
+            b"unrelated game preferences fixture"
+        );
+    }
+
+    #[test]
+    fn stable_discovery_preserves_explicit_selection_even_when_it_is_missing() {
+        let fixture = Fixture::new();
+        let installed = fixture.paths.local.join("osu!");
+        fs::create_dir(&installed).unwrap();
+        write_pe(&installed.join("osu!.exe"), 0x14c);
+        let explicit = fixture.directory.join("moved-install").join("osu!.exe");
+        let preferences = Preferences {
+            stable: Some(explicit.clone()),
+            ..Preferences::default()
+        };
+        write_json(&fixture.paths.prefs(), &preferences).unwrap();
+        let before = fs::read(fixture.paths.prefs()).unwrap();
+
+        assert_eq!(
+            selected_client_path(&fixture.paths, &preferences, Client::Stable),
+            Some(explicit.clone())
+        );
+        assert_eq!(
+            snapshot_at(&fixture.paths).unwrap().stable.path,
+            Some(display_path(&explicit))
+        );
+        assert!(start_session(&fixture.paths, Client::Stable).is_err());
+        assert_eq!(fs::read(fixture.paths.prefs()).unwrap(), before);
+        assert!(!fixture.paths.session().exists());
+    }
+
+    #[test]
+    fn stable_discovery_ignores_absent_directory_and_invalid_executables() {
+        let fixture = Fixture::new();
+        let preferences = Preferences::default();
+        let discover = || selected_client_path(&fixture.paths, &preferences, Client::Stable);
+        assert!(discover().is_none());
+        let installed = fixture.paths.local.join("osu!");
+        fs::create_dir(&installed).unwrap();
+        let executable = installed.join("osu!.exe");
+        fs::write(&executable, b"not a Windows executable").unwrap();
+        assert!(discover().is_none());
+        write_pe(&executable, 0xaa64);
+        assert!(discover().is_none());
+        fs::remove_file(&executable).unwrap();
+        fs::create_dir(&executable).unwrap();
+        assert!(discover().is_none());
+        assert!(snapshot_at(&fixture.paths).unwrap().stable.path.is_none());
+        assert!(!fixture.paths.prefs().exists());
     }
 
     #[test]
