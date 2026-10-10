@@ -47,7 +47,7 @@ try {
     $bridge = Join-Path $bridgeOutput 'osu.Game.Rulesets.Transfiguration.dll'
     $env:ILLYA_BRIDGE_SHA256 = (Get-FileHash -LiteralPath $bridge -Algorithm SHA256).Hash.ToLowerInvariant()
     $bridgeManifest = Get-Content -LiteralPath (Join-Path $bridgeOutput 'artifact.json') -Raw | ConvertFrom-Json
-    if ($bridgeManifest.protocol -ne 1 -or $bridgeManifest.fixture -ne $false -or $bridgeManifest.default_endpoint -cne 'https://illya.test' -or $bridgeManifest.endpoint_mode -cne 'https_origin_per_session' -or $bridgeManifest.configurable_endpoint -isnot [bool] -or !$bridgeManifest.configurable_endpoint -or $bridgeManifest.sha256 -ne $env:ILLYA_BRIDGE_SHA256) { throw 'Production bridge manifest validation failed.' }
+    if ($bridgeManifest.protocol -ne 1 -or $bridgeManifest.fixture -ne $false -or $bridgeManifest.default_endpoint -cne 'https://shdcloud.top' -or $bridgeManifest.endpoint_mode -cne 'https_origin_per_session' -or $bridgeManifest.configurable_endpoint -isnot [bool] -or !$bridgeManifest.configurable_endpoint -or $bridgeManifest.sha256 -ne $env:ILLYA_BRIDGE_SHA256) { throw 'Production bridge manifest validation failed.' }
     & npm run build --workspace '@illyaverse/kaleidoscope'
     Assert-Build 'Launcher interface build'
     $cargoArguments = @('build', '--manifest-path', 'tools/kaleidoscope/ui/src-tauri/Cargo.toml', '--locked', '--features', 'custom-protocol')

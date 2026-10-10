@@ -123,7 +123,7 @@ function Assert-PackageProtocol($Value, [string]$Name) {
 }
 
 function Assert-PackageEndpointPolicy($Value, [string]$Name) {
-    Assert-PackageLiteral $Value.default_endpoint 'https://illya.test' "$Name default_endpoint"
+    Assert-PackageLiteral $Value.default_endpoint 'https://shdcloud.top' "$Name default_endpoint"
     Assert-PackageLiteral $Value.endpoint_mode 'https_origin_per_session' "$Name endpoint_mode"
     Assert-PackageBoolean $Value.configurable_endpoint $true "$Name configurable_endpoint"
 }
@@ -433,7 +433,7 @@ From this directory in PowerShell, launch your installed stock lazer with:
 
 For a custom installation, replace that final path with its osu!.exe path.
 Use the selected Illyaverse deployment's website account. The default endpoint
-is https://illya.test; launcher settings accept a validated HTTPS origin for the
+is https://shdcloud.top; launcher settings accept a validated HTTPS origin for the
 next launch. The illya.test setup needs the existing local DNS/CA. TLS remains
 required and this package never falls back to official osu!.
 To view or save the next-launch endpoint:
@@ -467,7 +467,7 @@ See compatibility.json, Transfiguration-README.md and THIRD-PARTY-NOTICES.md.
     if ($hashes['Kaleidoscope.exe'] -cne (Get-FileHash -LiteralPath $LauncherPath -Algorithm SHA256).Hash.ToLowerInvariant() -or $hashes[$script:bridgeName] -cne $bridgeHash -or $hashes['compatibility.json'] -cne $expectedHash) { throw 'CLI source changed during assembly.' }
     $manifest = [ordered]@{
         version = 1; artifact_kind = 'cli_connection_test'; status = 'ready_for_manual_connection_test'
-        default_endpoint = 'https://illya.test'; endpoint_mode = 'https_origin_per_session'; configurable_endpoint = $true; fixture = $false; build_profile = 'debug'; bridge_sha256 = $bridgeHash
+        default_endpoint = 'https://shdcloud.top'; endpoint_mode = 'https_origin_per_session'; configurable_endpoint = $true; fixture = $false; build_profile = 'debug'; bridge_sha256 = $bridgeHash
         native_gui_verified = $false; native_login_verified = $false; verification_kind = 'cli_package_bindings_command'
         package_bindings = $bindings; completed_at_utc = [DateTime]::UtcNow.ToString('o'); content_sha256 = $hashes
     }
@@ -539,7 +539,7 @@ function New-KaleidoscopePackage {
 Kaleidoscope — Illyaverse local test package (__BUILD_PROFILE__)
 
 Run Kaleidoscope.exe, choose the installed stable/lazer osu!.exe, then launch.
-The default endpoint is https://illya.test. Settings accept a validated HTTPS
+The default endpoint is https://shdcloud.top. Settings accept a validated HTTPS
 origin for the next launch; an active session keeps its selected origin. The
 illya.test setup requires the documented local DNS/CA. TLS remains required;
 official osu! fallback is disabled. Stable requires the default HTTPS port 443;
@@ -573,7 +573,7 @@ and licenses/Nunito.txt and licenses/NotoSansTC.txt.
     if ($hashes['Kaleidoscope.exe'] -ine $InterfaceEvidence.launcher_sha256 -or $hashes['compatibility.json'] -ine $expectedCompatibilityHash) { throw 'Verified launcher or compatibility changed during package assembly.' }
     # Completion metadata is the final file written, after every required payload file.
     $manifest = [ordered]@{
-        version = 1; status = 'complete'; default_endpoint = 'https://illya.test'; endpoint_mode = 'https_origin_per_session'; configurable_endpoint = $true; fixture = $false; build_profile = $(if ($synthetic) { 'synthetic' } else { $BuildProfile.ToLowerInvariant() }); bridge_sha256 = $bridgeHash
+        version = 1; status = 'complete'; default_endpoint = 'https://shdcloud.top'; endpoint_mode = 'https_origin_per_session'; configurable_endpoint = $true; fixture = $false; build_profile = $(if ($synthetic) { 'synthetic' } else { $BuildProfile.ToLowerInvariant() }); bridge_sha256 = $bridgeHash
         embedded_interface_verified = !$synthetic; native_gui_verified = $false; verification_kind = $InterfaceEvidence.kind
         completed_at_utc = [DateTime]::UtcNow.ToString('o'); content_sha256 = $hashes
     }
