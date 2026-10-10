@@ -1,10 +1,12 @@
 name: Release Kaleidoscope (portable)
 
-# Pushing a tag such as v0.2.0 builds the Windows portable package on a
-# GitHub-hosted runner and publishes it as a GitHub Release.
+# Pushing a tag such as v0.2.0 builds the portable packages on GitHub-hosted
+# runners and publishes them as one GitHub Release:
+#   - Windows x64 (stable and lazer)
+#   - Linux x64 (lazer only, experimental)
 #
 # The Transfiguration bridge is compiled elsewhere (it needs an installed lazer,
-# which cannot be redistributed). This workflow downloads the release pinned in
+# which cannot be redistributed). Each job downloads the release pinned in
 # bridge-release.json, verifies its SHA-256 and bundles it unchanged.
 #
 # Releases are unsigned. The signed update feed stays in publish-update.yml.
@@ -26,19 +28,20 @@ concurrency:
   group: kaleidoscope-release-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
+env:
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+  PARENT_REPOSITORY: ${{ vars.ILLYAVERSE_PARENT_REPOSITORY || 'Illyavrs/Illyaverse' }}
+  PARENT_REF: ${{ vars.ILLYAVERSE_PARENT_REF || 'main' }}
+  GIT_CONFIG_COUNT: '2'
+  GIT_CONFIG_KEY_0: core.autocrlf
+  GIT_CONFIG_VALUE_0: 'false'
+  GIT_CONFIG_KEY_1: core.eol
+  GIT_CONFIG_VALUE_1: lf
+
 jobs:
   windows-x64:
     runs-on: windows-latest
     timeout-minutes: 60
-    env:
-      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
-      PARENT_REPOSITORY: ${{ vars.ILLYAVERSE_PARENT_REPOSITORY || 'Illyavrs/Illyaverse' }}
-      PARENT_REF: ${{ vars.ILLYAVERSE_PARENT_REF || 'main' }}
-      GIT_CONFIG_COUNT: '2'
-      GIT_CONFIG_KEY_0: core.autocrlf
-      GIT_CONFIG_VALUE_0: 'false'
-      GIT_CONFIG_KEY_1: core.eol
-      GIT_CONFIG_VALUE_1: lf
     steps:
       - name: Validate the release tag
         shell: pwsh
@@ -123,42 +126,130 @@ jobs:
           ./tools/kaleidoscope/scripts/verify-launcher-package.ps1 -Directory .artifacts/release/package
           ./tools/kaleidoscope/scripts/verify-launcher-package.ps1 -ArchivePath .artifacts/release/package.zip
 
-      - name: Name the archive and write checksums
+      - name: Name the archive
         shell: pwsh
         working-directory: workspace
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Path .artifacts/dist | Out-Null
-          $name = "Kaleidoscope-$env:RELEASE_VERSION-windows-x64-portable.zip"
-          Copy-Item .artifacts/release/package.zip (Join-Path .artifacts/dist $name)
-          $hash = (Get-FileHash -LiteralPath (Join-Path .artifacts/dist $name) -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  $name" | Out-File -FilePath .artifacts/dist/SHA256SUMS.txt -Encoding ascii
-          "ARCHIVE_NAME=$name" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Copy-Item .artifacts/release/package.zip ".artifacts/dist/Kaleidoscope-$env:RELEASE_VERSION-windows-x64-portable.zip"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: kaleidoscope-portable
+          name: kaleidoscope-windows-x64
           path: workspace/.artifacts/dist/
           if-no-files-found: error
           retention-days: 30
 
-      - name: Publish the GitHub release
-        shell: pwsh
+  linux-x64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Validate the release tag
+        run: |
+          set -eu
+          echo "$RELEASE_TAG" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' || { echo 'Use a canonical stable tag such as v0.2.0.' >&2; exit 1; }
+          echo "RELEASE_VERSION=${RELEASE_TAG#v}" >> "$GITHUB_ENV"
+
+      - name: Check out the Illyaverse workspace with its components
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PARENT_REPOSITORY }}
+          ref: ${{ env.PARENT_REF }}
+          path: workspace
+          submodules: recursive
+          persist-credentials: false
+          token: ${{ secrets.ILLYAVERSE_READ_TOKEN || github.token }}
+
+      - name: Build exactly the tagged Kaleidoscope source
+        working-directory: workspace/tools/kaleidoscope
+        run: |
+          set -eu
+          git fetch --tags origin
+          git checkout --detach "refs/tags/$RELEASE_TAG"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: workspace/package-lock.json
+
+      - name: Install the Rust toolchain and the GTK/WebKit development files
+        run: |
+          set -eu
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libayatana-appindicator3-dev librsvg2-dev pkg-config
+
+      - name: Download and verify the pinned Transfiguration bridge
         working-directory: workspace
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          repository=$(node -p "require('./tools/kaleidoscope/bridge-release.json').repository || ''")
+          version=$(node -p "require('./tools/kaleidoscope/bridge-release.json').version || ''")
+          sha256=$(node -p "require('./tools/kaleidoscope/bridge-release.json').sha256 || ''")
+          [ -n "$repository" ] && [ -n "$version" ] && [ -n "$sha256" ] || { echo 'Set repository, version and sha256 in tools/kaleidoscope/bridge-release.json to a published Transfiguration release first.' >&2; exit 1; }
+          echo "$version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' && echo "$sha256" | grep -Eq '^[0-9a-f]{64}$' || { echo 'Invalid bridge pin.' >&2; exit 1; }
+          asset="Transfiguration-$version-windows-x64.zip"
+          mkdir -p .artifacts/bridge-download .artifacts/bridge
+          gh release download "v$version" --repo "$repository" --pattern "$asset" --dir .artifacts/bridge-download
+          echo "$sha256  .artifacts/bridge-download/$asset" | sha256sum -c -
+          unzip -q -o ".artifacts/bridge-download/$asset" -d .artifacts/bridge
+          # The bridge is managed code; the same DLL runs on both platforms.
+          [ -f .artifacts/bridge/Transfiguration-README.md ] && cp .artifacts/bridge/Transfiguration-README.md .artifacts/bridge/README.md
+          echo "TRANSFIGURATION_BUNDLED_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Restore the locked JavaScript dependencies
+        working-directory: workspace
+        run: npm ci
+
+      - name: Build the Linux portable package
+        working-directory: workspace
+        run: |
+          set -eu
+          sh tools/kaleidoscope/scripts/package-launcher-linux.sh .artifacts/bridge .artifacts/release "$RELEASE_VERSION"
+          mkdir -p .artifacts/dist
+          cp ".artifacts/release/Kaleidoscope-$RELEASE_VERSION-linux-x64-portable.tar.gz" .artifacts/dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kaleidoscope-linux-x64
+          path: workspace/.artifacts/dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    needs: [windows-x64, linux-x64]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          $notes = @"
-          Portable Windows x64 launcher. Extract **all files** into one folder and run ``Kaleidoscope.exe``.
+          set -eu
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat > notes.md <<'NOTES'
+          Portable packages. Extract **all files** into one folder and run `Kaleidoscope` (`Kaleidoscope.exe` on Windows).
 
-          - Unsigned build. Verify the archive against ``SHA256SUMS.txt``.
-          - Uses your installed osu!stable or osu!lazer; no game files are included.
-          - Bundled Transfiguration bridge: see ``tools/kaleidoscope/bridge-release.json``.
-          - Windows only for now; the launcher does not support Linux yet.
-          "@
-          gh release view $env:RELEASE_TAG 2>$null | Out-Null
-          if ($LASTEXITCODE -eq 0) { throw 'The release already exists; assets are not replaced. Delete the release first to rebuild it.' }
-          gh release create $env:RELEASE_TAG ".artifacts/dist/$env:ARCHIVE_NAME" .artifacts/dist/SHA256SUMS.txt --verify-tag --title "Kaleidoscope $env:RELEASE_VERSION" --notes $notes
-          if ($LASTEXITCODE -ne 0) { throw 'GitHub release publication failed.' }
+          - **Windows x64**: osu!stable and osu!lazer.
+          - **Linux x64**: osu!lazer only, experimental. Needs GTK 3 and WebKitGTK 4.1. Choose `osu.AppImage` (made executable) or an extracted install.
+          - Unsigned builds: verify archives against `SHA256SUMS.txt`.
+          - Uses your installed game; no game files are included.
+          - Bundled Transfiguration bridge: see `tools/kaleidoscope/bridge-release.json`.
+          NOTES
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo 'The release already exists; assets are not replaced. Delete the release first to rebuild it.' >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" ./*.zip ./*.tar.gz SHA256SUMS.txt --verify-tag --title "Kaleidoscope ${RELEASE_TAG#v}" --notes-file notes.md

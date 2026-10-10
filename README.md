@@ -88,10 +88,22 @@ and licenses.
 ## Releases
 
 Pushing a tag such as `v0.2.0` runs `.github/workflows/release.yml`: it builds the
-Windows x64 portable package on a GitHub-hosted runner and publishes it with
-`SHA256SUMS.txt`. Releases are unsigned. The Transfiguration bridge is not compiled
+Windows x64 and Linux x64 portable packages on GitHub-hosted runners and publishes
+them with `SHA256SUMS.txt`. Releases are unsigned. The Transfiguration bridge is not compiled
 there (that needs an installed lazer); set `bridge-release.json` to a published
 Transfiguration release (`version` and the archive `sha256`) before tagging. The
 self-hosted `build-kaleidoscope.yml` and the signed `publish-update.yml` remain.
 
-The launcher supports Windows only; it refuses to start on other systems.
+## Linux (lazer only)
+
+The Linux build runs osu!lazer through the same startup bridge: it hosts the
+installed game with its own `libhostfxr.so`, tracks the process through `/proc`,
+and keeps the data folder under `$XDG_DATA_HOME` (`~/.local/share`). Select the
+lazer `osu.AppImage` (make it executable first); it is extracted once into the
+launcher's private folder. An extracted install works too. osu!stable is not
+supported on Linux. Only lazer 2026.1005.1-tachyon (linux-x64) is accepted, and
+this build is experimental: it has not been run against a real game yet.
+
+```sh
+sh tools/kaleidoscope/scripts/package-launcher-linux.sh <bridge-dir> <output-dir> [version]
+```
