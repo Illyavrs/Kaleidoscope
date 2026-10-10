@@ -20,8 +20,8 @@ Kaleidoscope connects installed clients to Illyaverse: stable uses
 The default endpoint is `https://illya.test`. Saved settings apply to the next
 launch; the current session keeps its original endpoint. Public servers need
 DNS and trusted HTTPS. The development endpoint needs
-[local DNS and CA setup](https://github.com/Illyavrs/Illyaverse/blob/main/docs/local-client-testing.md).
-See the [launcher guide](https://github.com/Illyavrs/Illyaverse/blob/main/docs/kaleidoscope-launcher.md)
+[local DNS and CA setup](https://github.com/Illyavrs/Illyaverse/blob/main/apps/docs/content/docs/clients/local-client-testing.md).
+See the [launcher guide](https://github.com/Illyavrs/Illyaverse/blob/main/apps/docs/content/docs/clients/kaleidoscope-launcher.md)
 for endpoint rules, restart and recovery.
 
 lazer reuses the existing beatmap library and shared `game.ini` preferences.
@@ -30,7 +30,7 @@ official account fields are preserved. Unsupported client files or uncertain
 storage stop startup, and failed connections never fall back to official servers.
 After exit, a guardian removes only the unchanged bridge DLL installed by that
 session. Keep the package in place until cleanup finishes. See
-[connection requirements](https://github.com/Illyavrs/Illyaverse/blob/main/docs/connection.md)
+[connection requirements](https://github.com/Illyavrs/Illyaverse/blob/main/apps/docs/content/docs/clients/connection.md)
 and the [exact compatibility manifest](https://github.com/Illyavrs/Transfiguration/blob/main/compatibility.json).
 
 ## CLI
@@ -66,7 +66,7 @@ and native launcher into a directory and ZIP, without bundling osu!. See the
 launcher guide for custom paths and verification.
 
 The manual parent CI producer builds verified Release packages on a dedicated
-Windows runner. See [Release builds](https://github.com/Illyavrs/Illyaverse/blob/main/docs/launcher-release-builds.md)
+Windows runner. See [Release builds](https://github.com/Illyavrs/Illyaverse/blob/main/apps/docs/content/docs/deploy/launcher-release-builds.md)
 for runner configuration, source receipts and separate publishing. Actual CI
 Release builds remain pending.
 
@@ -80,7 +80,7 @@ configured, so automatic updates remain unavailable. See [update setup](docs/upd
 Local GUI packages are unsigned Debug test builds. Native client verification
 remains pending, and production Release packaging currently encounters Windows
 error 5. See the
-[current integration record](https://github.com/Illyavrs/Illyaverse/blob/main/docs/current-integration-20261010.md).
+[current integration record](https://github.com/Illyavrs/Illyaverse/blob/main/apps/docs/content/docs/reference/release-readiness.md).
 
 Licensed under the [MIT License](LICENSE). Packages include dependency notices
 and licenses.
