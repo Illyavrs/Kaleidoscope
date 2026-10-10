@@ -17,7 +17,7 @@ Kaleidoscope connects installed clients to Illyaverse: stable uses
 4. Save the server's HTTPS origin in Settings, launch, and sign in with the
    website account.
 
-The default endpoint is `https://illya.test`. Saved settings apply to the next
+The default endpoint is `https://shdcloud.top`. Saved settings apply to the next
 launch; the current session keeps its original endpoint. Public servers need
 DNS and trusted HTTPS. The development endpoint needs
 [local DNS and CA setup](https://github.com/Illyavrs/Illyaverse/blob/main/apps/docs/content/docs/connecting-players.md).
@@ -84,3 +84,14 @@ error 5. See the
 
 Licensed under the [MIT License](LICENSE). Packages include dependency notices
 and licenses.
+
+## Releases
+
+Pushing a tag such as `v0.2.0` runs `.github/workflows/release.yml`: it builds the
+Windows x64 portable package on a GitHub-hosted runner and publishes it with
+`SHA256SUMS.txt`. Releases are unsigned. The Transfiguration bridge is not compiled
+there (that needs an installed lazer); set `bridge-release.json` to a published
+Transfiguration release (`version` and the archive `sha256`) before tagging. The
+self-hosted `build-kaleidoscope.yml` and the signed `publish-update.yml` remain.
+
+The launcher supports Windows only; it refuses to start on other systems.

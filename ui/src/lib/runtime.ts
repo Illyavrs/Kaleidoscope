@@ -12,7 +12,7 @@ export interface LauncherSnapshot {
 }
 
 export interface LauncherSettings { endpoint: string }
-export const defaultEndpoint = 'https://illya.test';
+export const defaultEndpoint = 'https://shdcloud.top';
 
 export type UpdateComponent = 'launcher' | 'bridge';
 export interface UpdateStatus {
@@ -61,11 +61,11 @@ export function validateEndpoint(value: string): string | null {
     if (!/^https:\/\//iu.test(value) || url.protocol !== 'https:' || !url.hostname) return '伺服器網址必須使用 https://。';
     if (url.username || url.password || value.includes('?') || value.includes('#') || !['', '/'].includes(url.pathname)) return '請只填伺服器的基底網址，不要包含帳密、路徑、查詢或 #。';
     const host = url.hostname.toLowerCase().replace(/\.$/u, '');
-    if (!host.includes('.') || /^[\d.]+$/u.test(host) || host.includes(':')) return '請使用完整的伺服器網域，例如 illya.test。';
+    if (!host.includes('.') || /^[\d.]+$/u.test(host) || host.includes(':')) return '請使用完整的伺服器網域，例如 shdcloud.top。';
     if (host === 'ppy.sh' || host.endsWith('.ppy.sh')) return '請填 Illyaverse 伺服器的網址，不能使用官方伺服器。';
     return null;
   } catch {
-    return '網址格式不正確，例如 https://illya.test。';
+    return '網址格式不正確，例如 https://shdcloud.top。';
   }
 }
 

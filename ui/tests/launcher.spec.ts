@@ -11,7 +11,7 @@ const ready: LauncherSnapshot = {
 async function mockNative(page: Page, state: LauncherSnapshot, options?: { endpoint?: string; failReads?: number; saveError?: string; readDelay?: number; pollDelay?: number }) {
   await page.addInitScript(({ initial, options }) => {
     let snapshot = structuredClone(initial);
-    let settings = { endpoint: options?.endpoint ?? 'https://illya.test' };
+    let settings = { endpoint: options?.endpoint ?? 'https://shdcloud.top' };
     let readFailures = options?.failReads ?? 0;
     let saveError = options?.saveError;
     const polls = { count: 0, active: 0, max: 0 };
@@ -156,7 +156,7 @@ test('unsupported lazer and failed cleanup block launching while cleanup remains
 test('server settings validate HTTPS origins before saving and preserve draft after a native save failure', async ({ page }) => {
   await mockNative(page, ready, { saveError: '設定檔無法寫入。請確認權限後重試。' });
   await page.goto('/');
-  await expect(page.getByTestId('saved-endpoint')).toHaveText('https://illya.test');
+  await expect(page.getByTestId('saved-endpoint')).toHaveText('https://shdcloud.top');
   await page.getByRole('button', { name: '設定', exact: true }).click();
   const field = page.getByRole('textbox', { name: '伺服器網址' });
   for (const invalid of ['http://illya.test', 'https://user:secret@example.test', 'https://example.test/api', 'https://example.test?token=fixture', 'https://example.test#fixture', 'https://osu.ppy.sh', 'https://example.test\\other', 'https://exam ple.test', 'https://localhost', 'https://127.0.0.1', 'https://[::1]', 'https://example.test?', 'https://example.test#']) {
@@ -171,7 +171,7 @@ test('server settings validate HTTPS origins before saving and preserve draft af
   await page.getByRole('button', { name: '儲存', exact: true }).click();
   await expect(page.getByText('設定檔無法寫入。請確認權限後重試。')).toBeVisible();
   await expect(field).toHaveValue('https://community.example.test:8443/');
-  await expect(page.getByTestId('saved-endpoint')).toHaveText('https://illya.test');
+  await expect(page.getByTestId('saved-endpoint')).toHaveText('https://shdcloud.top');
   await page.getByRole('button', { name: '儲存', exact: true }).click();
   await expect(page.getByText('已儲存', { exact: true })).toBeVisible();
   await expect(field).toHaveValue('https://community.example.test:8443');
@@ -194,12 +194,12 @@ test('saving while lazer runs affects the next launch and reset is an explicit s
   expect(saved.filter((entry) => entry.command === 'launcher_start' || entry.command === 'launcher_stop')).toEqual([]);
   expect(saved.filter((entry) => entry.command === 'launcher_set_endpoint')).toHaveLength(1);
   await page.getByRole('button', { name: '還原預設網址' }).click();
-  await expect(field).toHaveValue('https://illya.test');
+  await expect(field).toHaveValue('https://shdcloud.top');
   await expect(page.getByTestId('saved-endpoint')).toHaveText('https://next.example.test');
   await page.getByRole('button', { name: '儲存', exact: true }).click();
-  await expect(page.getByTestId('saved-endpoint')).toHaveText('https://illya.test');
+  await expect(page.getByTestId('saved-endpoint')).toHaveText('https://shdcloud.top');
   await page.getByRole('button', { name: '關閉並重新啟動 lazer' }).click();
-  await expect(page.getByText('本次遊戲連線：')).toHaveText('本次遊戲連線：https://illya.test');
+  await expect(page.getByText('本次遊戲連線：')).toHaveText('本次遊戲連線：https://shdcloud.top');
 });
 
 test('settings read failure has an independent retry and does not block stale plugin cleanup', async ({ page }) => {
@@ -211,7 +211,7 @@ test('settings read failure has an independent retry and does not block stale pl
   await page.getByRole('button', { name: '重試清理' }).click();
   await expect(page.getByTestId('cleanup-status')).toHaveText('沒有暫存的連線 ruleset');
   await page.getByRole('button', { name: '重試讀取' }).click();
-  await expect(page.getByTestId('saved-endpoint')).toHaveText('https://illya.test');
+  await expect(page.getByTestId('saved-endpoint')).toHaveText('https://shdcloud.top');
   await expect(page.getByRole('button', { name: '啟動 lazer', exact: true })).toBeEnabled();
 });
 
@@ -245,7 +245,7 @@ test('settings cannot open with an empty draft during the initial slow read', as
 test('slow snapshot polls never overlap and regress the displayed lifecycle', async ({ page }) => {
   await mockNative(page, ready, { pollDelay: 3200 });
   await page.goto('/');
-  await expect(page.getByTestId('saved-endpoint')).toHaveText('https://illya.test');
+  await expect(page.getByTestId('saved-endpoint')).toHaveText('https://shdcloud.top');
   await expect.poll(async () => page.evaluate(() => (window as unknown as { __launcherTestPolls: { count: number } }).__launcherTestPolls.count), { timeout: 8000 }).toBeGreaterThanOrEqual(3);
   const polls = await page.evaluate(() => (window as unknown as { __launcherTestPolls: { max: number } }).__launcherTestPolls);
   expect(polls.max).toBe(1);

@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-const SERVER: &str = "https://illya.test";
+const SERVER: &str = "https://shdcloud.top";
 // Only stock assemblies independently inspected and tested with the bridge.
 const SUPPORTED_GAME_SHA256: &str =
     "ad9527e411111cb4b4045c76df61c3474fd872a04af73160c05d24e44a588249";

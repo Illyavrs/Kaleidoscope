@@ -5,7 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use url::{Host, Url};
 
 const MAX_ENDPOINT_BYTES: usize = 2048;
-const DEFAULT_ORIGIN: &str = "https://illya.test";
+const DEFAULT_ORIGIN: &str = "https://shdcloud.top";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Endpoint {
@@ -133,7 +133,7 @@ impl Default for Endpoint {
     fn default() -> Self {
         Self {
             origin: DEFAULT_ORIGIN.into(),
-            domain: "illya.test".into(),
+            domain: "shdcloud.top".into(),
             port: 443,
         }
     }
@@ -240,7 +240,7 @@ mod tests {
             Endpoint::default(),
             Endpoint::parse(DEFAULT_ORIGIN).unwrap()
         );
-        assert_eq!(Endpoint::default().stable_domain().unwrap(), "illya.test");
+        assert_eq!(Endpoint::default().stable_domain().unwrap(), "shdcloud.top");
         assert!(Endpoint::parse("https://server.example:8443")
             .unwrap()
             .stable_domain()

@@ -29,7 +29,7 @@ async function mockNative(page: Page, options: {
     const readyObservations: { headingVisible: boolean; stablePathVisible: boolean }[] = [];
     const snapshot = structuredClone(initial);
     let failures = options.checkFailures ?? 0;
-    let settings = { endpoint: 'https://illya.test' };
+    let settings = { endpoint: 'https://shdcloud.top' };
     Object.assign(window, {
       isTauri: true,
       __updateCommands: commands,
