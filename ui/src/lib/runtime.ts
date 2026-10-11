@@ -1,12 +1,13 @@
 export type Client = 'stable' | 'lazer';
 export type Phase = 'idle' | 'preparing' | 'running' | 'closing' | 'cleaning' | 'cleanup_failed' | 'error';
-export type Compatibility = 'unknown' | 'supported' | 'unsupported';
+export type Compatibility = 'unknown' | 'supported' | 'unverified' | 'unsupported';
 
 export interface LauncherSnapshot {
   /** Linux supports lazer only; older native builds omit the field (Windows). */
   platform?: 'windows' | 'linux';
   stable: { path: string | null; running: boolean };
-  lazer: { path: string | null; running: boolean; compatibility: Compatibility };
+  /** `unverified` is a valid install of a release other than `recommendedVersion`; it starts only after risk acceptance. */
+  lazer: { path: string | null; running: boolean; compatibility: Compatibility; recommendedVersion?: string };
   phase: Phase;
   detail: string;
   pluginPresent: boolean;
@@ -37,7 +38,7 @@ export type LauncherCommand = 'launcher_snapshot' | 'launcher_choose_path' | 'la
 export interface LauncherBridge {
   mode: 'native' | 'preview';
   interactive: boolean;
-  call(command: LauncherCommand, args?: { client: Client }): Promise<LauncherSnapshot>;
+  call(command: LauncherCommand, args?: { client: Client; acceptRisk?: boolean }): Promise<LauncherSnapshot>;
   settings(): Promise<LauncherSettings>;
   saveEndpoint(endpoint: string): Promise<LauncherSettings>;
   ready(): Promise<void>;
@@ -47,7 +48,7 @@ export interface LauncherBridge {
 }
 
 const phases: Phase[] = ['idle', 'preparing', 'running', 'closing', 'cleaning', 'cleanup_failed', 'error'];
-const compatibility: Compatibility[] = ['unknown', 'supported', 'unsupported'];
+const compatibility: Compatibility[] = ['unknown', 'supported', 'unverified', 'unsupported'];
 
 export const emptySnapshot: LauncherSnapshot = {
   stable: { path: null, running: false },

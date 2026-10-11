@@ -18,6 +18,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+/// The lazer release the bridge was inspected and tested against; other releases may start only after
+/// the player accepts the risk.
+pub const RECOMMENDED_LAZER_VERSION: &str = "2026.1005.1";
 const SERVER: &str = "https://shdcloud.top";
 // Only stock assemblies independently inspected and tested with the bridge.
 // Each platform ships its own build of the same lazer release.
@@ -88,7 +91,10 @@ pub enum Phase {
 #[serde(rename_all = "lowercase")]
 pub enum Compatibility {
     Unknown,
+    /// Every checked assembly matches the release the bridge was tested with.
     Supported,
+    /// A valid lazer install of another version: launching needs explicit risk acceptance.
+    Unverified,
     Unsupported,
 }
 
@@ -105,6 +111,7 @@ pub struct LazerSnapshot {
     pub path: Option<String>,
     pub running: bool,
     pub compatibility: Compatibility,
+    pub recommended_version: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -205,6 +212,9 @@ struct Session {
     // permits that fixed historical location while migrating recovery records.
     #[serde(default)]
     legacy_ready: bool,
+    /// The player accepted the risk of starting a lazer release the bridge was not tested with.
+    #[serde(default)]
+    accept_risk: bool,
     phase: Phase,
     detail: String,
     stop_requested: bool,
@@ -466,17 +476,17 @@ pub fn save_client_path(client: Client, executable: impl AsRef<Path>) -> Result<
 
 /// A click authorizes gracefully restarting the exact selected installation.
 /// No unrelated process or official-profile data is modified.
-pub fn start(client: Client) -> Result<Snapshot> {
+pub fn start(client: Client, accept_risk: bool) -> Result<Snapshot> {
     let paths = Paths::production()?;
-    start_session(&paths, client)?;
+    start_session(&paths, client, accept_risk)?;
     snapshot_at(&paths)
 }
 
 /// The CLI stays attached until the exact new session reaches a verified
 /// outcome. The GUI continues using the asynchronous `start` API.
-pub fn start_and_wait(client: Client) -> Result<Snapshot> {
+pub fn start_and_wait(client: Client, accept_risk: bool) -> Result<Snapshot> {
     let paths = Paths::production()?;
-    let nonce = start_session(&paths, client)?;
+    let nonce = start_session(&paths, client, accept_risk)?;
     wait_for_start(|| matching_session(&paths, &nonce), CLI_START_TIMEOUT)?;
     snapshot_at(&paths)
 }
@@ -506,7 +516,7 @@ fn wait_for_start(mut read: impl FnMut() -> Result<Session>, timeout: Duration) 
     }
 }
 
-fn start_session(paths: &Paths, client: Client) -> Result<String> {
+fn start_session(paths: &Paths, client: Client, accept_risk: bool) -> Result<String> {
     let preferences = read_preferences(paths)?;
     if client == Client::Stable {
         preferences.endpoint.stable_domain()?;
@@ -515,7 +525,7 @@ fn start_session(paths: &Paths, client: Client) -> Result<String> {
         .ok_or_else(|| format!("請先選擇 {CLIENT_FILENAME} 安裝路徑"))?;
     let selected = validate_client(&selected, client)?;
     if client == Client::Lazer {
-        verify_lazer_compatibility(paths, &selected)?;
+        verify_lazer_compatibility(paths, &selected, accept_risk)?;
     }
     if read_session(paths)?
         .as_ref()
@@ -561,6 +571,7 @@ fn start_session(paths: &Paths, client: Client) -> Result<String> {
         install_session: None,
         library,
         legacy_ready: false,
+        accept_risk,
         phase: Phase::Preparing,
         detail: "正在準備 Illyaverse 連線".into(),
         stop_requested: false,
@@ -643,12 +654,12 @@ fn snapshot_at(paths: &Paths) -> Result<Snapshot> {
     let compatibility = match &preferences.lazer {
         None => Compatibility::Unknown,
         Some(path) => {
-            if validate_client(path, Client::Lazer).is_ok()
-                && verify_lazer_compatibility(paths, path).is_ok()
-            {
+            if validate_client(path, Client::Lazer).is_err() || verify_bridge(paths).is_err() {
+                Compatibility::Unsupported
+            } else if verify_lazer_compatibility(paths, path, false).is_ok() {
                 Compatibility::Supported
             } else {
-                Compatibility::Unsupported
+                Compatibility::Unverified
             }
         }
     };
@@ -676,6 +687,7 @@ fn snapshot_at(paths: &Paths) -> Result<Snapshot> {
             path: preferences.lazer.as_deref().map(display_path),
             running: selected_running(Client::Lazer)?,
             compatibility,
+            recommended_version: RECOMMENDED_LAZER_VERSION,
         },
         phase: session
             .as_ref()
@@ -975,7 +987,7 @@ fn run_client(
         return Err("選擇的遊戲執行檔已變更；請重新選擇路徑".into());
     }
     if session.client == Client::Lazer {
-        verify_lazer_compatibility(paths, &selected)?;
+        verify_lazer_compatibility(paths, &selected, session.accept_risk)?;
         refuse_other_lazer_instances()?;
         session
             .library
@@ -1355,7 +1367,7 @@ fn run_lazer_host(paths: &Paths, nonce: &str) -> Result<i32> {
     };
     let preflight = (|| -> Result<(PathBuf, PathBuf)> {
         let selected = validate_client(&session.selected_executable, Client::Lazer)?;
-        verify_lazer_compatibility(paths, &selected)?;
+        verify_lazer_compatibility(paths, &selected, session.accept_risk)?;
         let install = selected.parent().ok_or("lazer 缺少安裝資料夾")?;
         let library = session
             .library
@@ -1994,12 +2006,21 @@ fn verify_bridge_artifact(artifact: &Path, hash: &str) -> Result<()> {
     Ok(())
 }
 
-fn verify_lazer_compatibility(paths: &Paths, selected: &Path) -> Result<()> {
+/// Hash-checks the install against the release the bridge was tested with. A mismatch is allowed only
+/// when the player accepted the risk for this session; the bridge itself is always verified, and a
+/// failed connection still never falls back to the official servers.
+fn verify_lazer_compatibility(paths: &Paths, selected: &Path, accept_risk: bool) -> Result<()> {
     verify_bridge(paths)?;
     let directory = selected.parent().ok_or("lazer 缺少安裝資料夾")?;
     for (filename, expected) in expected_native_assemblies_at_launcher(&paths.launcher)? {
         if artifact_sha256(directory.join(filename))? != expected {
-            return Err("這個 lazer 版本尚未通過相容性驗證；不會啟動或切回官方伺服器".into());
+            if accept_risk {
+                return Ok(());
+            }
+            return Err(format!(
+                "這個 lazer 版本不是建議版本（{RECOMMENDED_LAZER_VERSION}），尚未通過相容性驗證。若要啟動，請勾選「我了解風險」；不會切回官方伺服器"
+            )
+            .into());
         }
     }
     Ok(())
@@ -2429,6 +2450,7 @@ mod tests {
                 install_session: None,
                 library: Some(resolve_library(paths, &self.client).unwrap()),
                 legacy_ready: false,
+                accept_risk: false,
                 phase: Phase::Preparing,
                 detail: "fixture preparing".into(),
                 stop_requested: false,
@@ -2490,7 +2512,7 @@ mod tests {
             json!({
                 "platform":if cfg!(windows) { "windows" } else { "linux" },
                 "stable":{"path":null,"running":false},
-                "lazer":{"path":null,"running":false,"compatibility":"unknown"},
+                "lazer":{"path":null,"running":false,"compatibility":"unknown","recommendedVersion":RECOMMENDED_LAZER_VERSION},
                 "phase":"idle","detail":"未找到 stable 預設安裝位置，請選擇遊戲安裝路徑。","pluginPresent":false,"activeEndpoint":null
             })
         );
@@ -2557,7 +2579,7 @@ mod tests {
             snapshot_at(&fixture.paths).unwrap().stable.path,
             Some(display_path(&explicit))
         );
-        assert!(start_session(&fixture.paths, Client::Stable).is_err());
+        assert!(start_session(&fixture.paths, Client::Stable, false).is_err());
         assert_eq!(fs::read(fixture.paths.prefs()).unwrap(), before);
         assert!(!fixture.paths.session().exists());
     }
@@ -2652,7 +2674,7 @@ mod tests {
         };
         write_json(&fixture.paths.prefs(), &preferences).unwrap();
         let before = fs::read(fixture.paths.prefs()).unwrap();
-        assert!(start_session(&fixture.paths, Client::Stable)
+        assert!(start_session(&fixture.paths, Client::Stable, false)
             .unwrap_err()
             .contains("HTTPS port 443"));
         assert!(!fixture.paths.session().exists());
@@ -3916,7 +3938,7 @@ mod tests {
         let (bridge, hash) = fixture.bridge();
         verify_bridge_with_hash(&fixture.paths, &hash).unwrap();
         assert!(verify_bridge_with_hash(&fixture.paths, &"0".repeat(64)).is_err());
-        assert!(verify_lazer_compatibility(&fixture.paths, &fixture.client).is_err());
+        assert!(verify_lazer_compatibility(&fixture.paths, &fixture.client, false).is_err());
         fs::write(&bridge, b"tampered bridge").unwrap();
         assert!(verify_bridge_with_hash(&fixture.paths, &hash).is_err());
         write_elf(&fixture.client, 1, 0x3e); // 32-bit
@@ -3939,7 +3961,7 @@ mod tests {
         verify_bridge_with_hash(&fixture.paths, &hash).unwrap();
         assert!(verify_bridge_with_hash(&fixture.paths, &"0".repeat(64)).is_err());
         assert!(verify_bridge_with_hash(&fixture.paths, "not-a-hash").is_err());
-        assert!(verify_lazer_compatibility(&fixture.paths, &fixture.client).is_err());
+        assert!(verify_lazer_compatibility(&fixture.paths, &fixture.client, false).is_err());
         fs::write(&bridge, b"tampered bridge").unwrap();
         assert!(verify_bridge_with_hash(&fixture.paths, &hash).is_err());
         write_pe(&fixture.client, 0x14c);

@@ -48,8 +48,8 @@ async fn launcher_choose_path(app: tauri::AppHandle, client: Client) -> Result<S
 }
 
 #[tauri::command]
-async fn launcher_start(client: Client) -> Result<Snapshot, String> {
-    tauri::async_runtime::spawn_blocking(move || runtime::start(client))
+async fn launcher_start(client: Client, accept_risk: Option<bool>) -> Result<Snapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || runtime::start(client, accept_risk.unwrap_or(false)))
         .await
         .map_err(|_| "The client launch could not complete".to_owned())?
 }

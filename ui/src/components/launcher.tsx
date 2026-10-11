@@ -16,16 +16,20 @@ const busyPhases: Phase[] = ['preparing', 'closing', 'cleaning'];
 function ClientRow({ client, snapshot, endpoint, disabled, run, choose }: {
   client: Client; snapshot: LauncherSnapshot; disabled: boolean;
   endpoint: string | null;
-  run: () => void; choose: () => void;
+  run: (acceptRisk: boolean) => void; choose: () => void;
 }) {
   const state = snapshot[client];
+  // A release the bridge was not tested with can start only after the player accepts the risk.
+  const [riskAccepted, setRiskAccepted] = useState(false);
+  const unverified = client === 'lazer' && snapshot.lazer.compatibility === 'unverified';
   const customStablePort = client === 'stable' && endpoint && Boolean(new URL(endpoint).port);
-  const blocked = customStablePort || (client === 'lazer' && (snapshot.lazer.compatibility !== 'supported'
-    || (snapshot.pluginPresent && !snapshot.lazer.running)));
+  const blocked = customStablePort || (client === 'lazer' && (snapshot.lazer.compatibility === 'unsupported' || snapshot.lazer.compatibility === 'unknown'
+    || (unverified && !riskAccepted) || (snapshot.pluginPresent && !snapshot.lazer.running)));
   const linux = snapshot.platform === 'linux';
   const hint = customStablePort ? '目前網址使用自訂連接埠；stable 需要 HTTPS 443。'
     : client === 'stable' ? state.path ? '以 devserver 參數連到設定的伺服器。' : '未找到預設安裝位置，請選擇 osu!.exe。'
-    : snapshot.lazer.compatibility === 'unsupported' ? '此版本暫不支援，請等待啟動器與連線 ruleset 配套更新。'
+    : snapshot.lazer.compatibility === 'unsupported' ? '找不到有效的 lazer 安裝，或連線模組缺失，請重新選擇位置。'
+      : unverified ? `這不是建議版本${snapshot.lazer.recommendedVersion ? `（${snapshot.lazer.recommendedVersion}）` : ''}，尚未通過相容性驗證。`
       : snapshot.lazer.compatibility === 'unknown' && state.path ? '正在確認此版本的相容性。'
         : linux && !state.path ? '選擇 osu.AppImage，或解壓縮後的 osu!。'
           : '啟動前放入連線 ruleset，關閉後自動清理。';
@@ -45,9 +49,15 @@ function ClientRow({ client, snapshot, endpoint, disabled, run, choose }: {
           <FolderOpen size={15} aria-hidden="true" /><span>{state.path ? '變更位置' : '選擇位置'}</span>
         </Button>
       </div>
+      {unverified && (
+        <label className="risk-accept">
+          <input type="checkbox" checked={riskAccepted} onChange={(event) => setRiskAccepted(event.target.checked)} />
+          <span>我了解此版本未經測試，連線模組可能無法運作或造成遊戲異常，仍要啟動。</span>
+        </label>
+      )}
       <div className="client-action">
         <span>{client === 'lazer' ? '只會連線到設定的伺服器' : '既有 stable 客戶端'}</span>
-        <Button onClick={run} disabled={disabled || !state.path || blocked} aria-label={`${state.running ? '關閉並重新啟動' : '啟動'} ${client}`}>
+        <Button onClick={() => run(unverified && riskAccepted)} disabled={disabled || !state.path || blocked} aria-label={`${state.running ? '關閉並重新啟動' : '啟動'} ${client}`}>
           {state.running ? <RotateCcw size={15} aria-hidden="true" /> : <Play size={15} aria-hidden="true" />}
           {state.running ? '關閉並重新啟動' : '啟動'}
         </Button>
@@ -120,7 +130,7 @@ export function Launcher() {
     return () => { active = false; };
   }, [bridge]);
 
-  async function action(command: LauncherCommand, client?: Client) {
+  async function action(command: LauncherCommand, client?: Client, acceptRisk = false) {
     if (!bridge?.interactive || invoking.current || changingSettings.current || updating.current
       || (!settings && (command === 'launcher_start' || command === 'launcher_choose_path'))) return;
     invoking.current = true;
@@ -135,7 +145,7 @@ export function Launcher() {
       setSnapshot((current) => ({ ...current, phase: command === 'launcher_stop' ? 'closing' : 'cleaning', detail: '請等待遊戲關閉與連線 ruleset 清理完成。' }));
     }
     try {
-      const next = await bridge.call(command, client ? { client } : undefined);
+      const next = await bridge.call(command, client ? (command === 'launcher_start' && acceptRisk ? { client, acceptRisk } : { client }) : undefined);
       if (mounted.current) setSnapshot(next);
     } catch (error) {
       if (mounted.current) setSnapshot((current) => ({
@@ -210,7 +220,7 @@ export function Launcher() {
         <ServerSettings settings={settings} activeEndpoint={snapshot.activeEndpoint} interactive={Boolean(bridge?.interactive)} busy={settingsPending} operationBusy={busy}
           loadError={settingsError} retry={() => void retrySettings()} save={saveEndpoint} />
         {snapshot.platform !== 'linux' && <ClientRow client="stable" snapshot={snapshot} endpoint={settings?.endpoint ?? null} disabled={blocked} choose={() => void action('launcher_choose_path', 'stable')} run={() => void action('launcher_start', 'stable')} />}
-        <ClientRow client="lazer" snapshot={snapshot} endpoint={settings?.endpoint ?? null} disabled={blocked} choose={() => void action('launcher_choose_path', 'lazer')} run={() => void action('launcher_start', 'lazer')} />
+        <ClientRow client="lazer" snapshot={snapshot} endpoint={settings?.endpoint ?? null} disabled={blocked} choose={() => void action('launcher_choose_path', 'lazer')} run={(acceptRisk) => void action('launcher_start', 'lazer', acceptRisk)} />
         <Updates bridge={bridge} installBlocked={busy || settingsPending || running || snapshot.pluginPresent || snapshot.phase !== 'idle'} beginInstall={beginUpdate} endInstall={endUpdate} />
       </div>
       <section className={`lifecycle ${error ? 'has-error' : ''}`} aria-label="啟動與清理狀態">

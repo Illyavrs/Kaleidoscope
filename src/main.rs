@@ -270,11 +270,17 @@ fn launcher_command(values: &[String]) -> Result<()> {
         ["set-client", kind, path] => {
             runtime::save_client_path(client(kind)?, std::path::Path::new(path))?
         }
-        ["start", kind] => runtime::start_and_wait(client(kind)?)?,
+        ["start", kind] => runtime::start_and_wait(client(kind)?, false)?,
+        ["start", kind, "--accept-risk"] => runtime::start_and_wait(client(kind)?, true)?,
         ["start", kind, path] => {
             let kind = client(kind)?;
             runtime::save_client_path(kind, std::path::Path::new(path))?;
-            runtime::start_and_wait(kind)?
+            runtime::start_and_wait(kind, false)?
+        }
+        ["start", kind, path, "--accept-risk"] => {
+            let kind = client(kind)?;
+            runtime::save_client_path(kind, std::path::Path::new(path))?;
+            runtime::start_and_wait(kind, true)?
         }
         ["stop"] => runtime::stop()?,
         ["recover"] => runtime::recover()?,
@@ -375,6 +381,7 @@ mod tests {
                 path: None,
                 running: false,
                 compatibility: Compatibility::Supported,
+                recommended_version: "2026.1005.1",
             },
             phase: Phase::Preparing,
             detail: "fixed diagnostic".into(),

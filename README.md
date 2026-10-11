@@ -26,8 +26,10 @@ for endpoint rules, restart and recovery.
 
 lazer reuses the existing beatmap library and shared `game.ini` preferences.
 Private accounts and sessions are isolated by endpoint in `auth.illyaverse.json`;
-official account fields are preserved. Unsupported client files or uncertain
-storage stop startup, and failed connections never fall back to official servers.
+official account fields are preserved. Invalid client files or uncertain
+storage stop startup. A lazer release other than the recommended one (2026.1005.1) is shown
+as unverified and starts only after you accept the risk (the GUI checkbox, or
+`--accept-risk` on the CLI); failed connections never fall back to official servers.
 After exit, a guardian removes only the unchanged bridge DLL installed by that
 session. Keep the package in place until cleanup finishes. See
 [connection requirements](https://github.com/Illyavrs/Illyaverse/blob/main/apps/docs/content/docs/connecting-players.md)
