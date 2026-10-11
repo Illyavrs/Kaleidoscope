@@ -691,10 +691,20 @@ fn snapshot_at(paths: &Paths) -> Result<Snapshot> {
         },
         phase: session
             .as_ref()
-            .map(|session| session.phase)
+            .map(|session| {
+                // A "closing" session whose game and guardian are both gone is stale.
+                if session.phase == Phase::Closing && !session_is_live(session).unwrap_or(true) {
+                    Phase::Idle
+                } else {
+                    session.phase
+                }
+            })
             .unwrap_or(Phase::Idle),
         detail: session
             .as_ref()
+            .filter(|session| {
+                session.phase != Phase::Closing || session_is_live(session).unwrap_or(true)
+            })
             .map(|session| session.detail.clone())
             .unwrap_or_else(|| {
                 if stable.is_some() || preferences.lazer.is_some() {
@@ -763,6 +773,12 @@ fn stop_at(paths: &Paths) -> Result<()> {
                 }
             }
         }
+    }
+    // Nothing is left to close (the game already exited or never ran), so no
+    // guardian will ever finish this session. Settle it here instead of leaving
+    // it in "closing" forever.
+    if !session_is_live(&session)? {
+        recover_at(paths)?;
     }
     Ok(())
 }
@@ -1048,6 +1064,16 @@ fn run_client(
     }
     sanitize_injection_environment(&mut command);
     hidden_child(&mut command);
+    if session.client == Client::Lazer {
+        // Keep the game's own output in a local file (replaced every launch) so a
+        // startup crash can be diagnosed. It never enters the session record.
+        if let Ok(log) = File::create(paths.control.join("lazer-last.log")) {
+            if let Ok(copy) = log.try_clone() {
+                command.stdout(Stdio::from(copy));
+            }
+            command.stderr(Stdio::from(log));
+        }
+    }
     let spawned = command.spawn().map_err(|_| "無法啟動選擇的遊戲")?;
     let pid = spawned.id();
     *child = Some(spawned);
@@ -1222,8 +1248,9 @@ fn finish_child_exit(
             "child_exit_failed"
         };
         Some(format!(
-            "遊戲啟動失敗：stage=child code={code} child_exit={}",
-            exit_detail(exit_code)
+            "遊戲啟動失敗：stage=child code={code} child_exit={} 遊戲輸出紀錄：{}",
+            exit_detail(exit_code),
+            display_path(&paths.control.join("lazer-last.log"))
         ))
     } else {
         None
