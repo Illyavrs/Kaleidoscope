@@ -52,7 +52,7 @@ function Test-SourceBindingsJson([string]$Text) {
 
 function New-SourceBindingsFixture {
     return [ordered]@{
-        protocol = 1; artifact_kind = 'cli_connection_test'; default_endpoint = 'https://illya.test'
+        protocol = 1; artifact_kind = 'cli_connection_test'; default_endpoint = 'https://shdcloud.top'
         endpoint_mode = 'https_origin_per_session'; configurable_endpoint = $true
         bridge_sha256 = ('a' * 64); bridge_verified = $true; official_fallback = $false
         shared_existing_library = $true; private_auth_filename = 'auth.illyaverse.json'; shared_game_preferences = $true
@@ -66,7 +66,7 @@ function Test-CompatibilityJson([string]$Text) {
         $hash = 'a' * 64
         $artifact = [ordered]@{
             protocol = 1; artifact = 'osu.Game.Rulesets.Transfiguration.dll'; sha256 = $hash
-            default_endpoint = 'https://illya.test'; endpoint_mode = 'https_origin_per_session'; configurable_endpoint = $true
+            default_endpoint = 'https://shdcloud.top'; endpoint_mode = 'https_origin_per_session'; configurable_endpoint = $true
             private_auth_filename = 'auth.illyaverse.json'; shared_game_preferences = $true; fixture = $false
         }
         $compatibility = Read-PackageJson $Json 'synthetic compatibility'
@@ -209,7 +209,7 @@ try {
     foreach ($name in @('Nunito.txt', 'NotoSansTC.txt')) { Write-Fixture (Join-Path $baseline "ui/licenses/$name") "synthetic GUI font license $name" }
     Write-Fixture (Join-Path $baseline 'bridge/compatibility.json') $compatibility
     Write-Fixture (Join-Path $fixtureRoot 'expected-compatibility.json') $compatibility
-    Write-FixtureJson (Join-Path $baseline 'bridge/artifact.json') @{ protocol = 1; artifact = 'osu.Game.Rulesets.Transfiguration.dll'; sha256 = (Get-FileHash -LiteralPath (Join-Path $baseline 'bridge/osu.Game.Rulesets.Transfiguration.dll') -Algorithm SHA256).Hash.ToLowerInvariant(); default_endpoint = 'https://illya.test'; endpoint_mode = 'https_origin_per_session'; configurable_endpoint = $true; private_auth_filename = 'auth.illyaverse.json'; shared_game_preferences = $true; fixture = $false }
+    Write-FixtureJson (Join-Path $baseline 'bridge/artifact.json') @{ protocol = 1; artifact = 'osu.Game.Rulesets.Transfiguration.dll'; sha256 = (Get-FileHash -LiteralPath (Join-Path $baseline 'bridge/osu.Game.Rulesets.Transfiguration.dll') -Algorithm SHA256).Hash.ToLowerInvariant(); default_endpoint = 'https://shdcloud.top'; endpoint_mode = 'https_origin_per_session'; configurable_endpoint = $true; private_auth_filename = 'auth.illyaverse.json'; shared_game_preferences = $true; fixture = $false }
 
     $script:valid = New-FixturePackage $baseline 'valid'
     $manifest = Test-KaleidoscopePackage -Directory $valid.Directory -AllowSyntheticFixtures
