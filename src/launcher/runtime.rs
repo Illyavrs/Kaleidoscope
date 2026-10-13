@@ -2046,8 +2046,7 @@ fn verify_lazer_compatibility(paths: &Paths, selected: &Path, accept_risk: bool)
             }
             return Err(format!(
                 "這個 lazer 版本不是建議版本（{RECOMMENDED_LAZER_VERSION}），尚未通過相容性驗證。若要啟動，請勾選「我了解風險」；不會切回官方伺服器"
-            )
-            .into());
+            ));
         }
     }
     Ok(())
