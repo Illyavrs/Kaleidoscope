@@ -119,6 +119,10 @@ jobs:
         working-directory: workspace
         env:
           KALEIDOSCOPE_UPDATE_VERSION: ${{ env.RELEASE_VERSION }}
+          # Unsigned GitHub-release channel: fixed repositories, no publisher key (see docs/updates.md).
+          KALEIDOSCOPE_UPDATE_UNSIGNED: "1"
+          KALEIDOSCOPE_UPDATE_REPOSITORY: Illyavrs/Kaleidoscope
+          TRANSFIGURATION_UPDATE_REPOSITORY: Illyavrs/Transfiguration
         run: |
           $ErrorActionPreference = 'Stop'
           # The packager requires its output parent to exist before it starts.

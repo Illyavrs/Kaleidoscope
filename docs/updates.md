@@ -13,6 +13,27 @@ Until the operator configures a published channel and its signing key, automatic
 updates remain unavailable. Package integrity does not prove native login,
 gameplay, or cleanup; preserve those separate verification results.
 
+## Unsigned GitHub-release channel
+
+The portable release workflow builds with `KALEIDOSCOPE_UPDATE_UNSIGNED=1` and no public
+key. Such a launcher checks the latest stable release of `Illyavrs/Kaleidoscope` and
+`Illyavrs/Transfiguration` on startup and installs it when the player clicks update. There is
+no `updates.json` and no publisher signature, so **a compromised GitHub account or release
+can ship code to every player**; the signed channel below is the way to remove that risk.
+
+Limits that remain enforced:
+
+- Fixed repositories compiled into the build, HTTPS only, asset URLs must equal the repository
+  and tag, and downloads follow only GitHub's fixed asset host.
+- Stable `X.Y.Z` tags only, no drafts or prereleases, strictly newer than the installed version;
+  a launcher update never installs an older bridge than the installed one.
+- The asset must carry GitHub's `sha256` digest and the downloaded bytes must match it, within
+  size bounds.
+- The ZIP must contain exactly the allowed file names, with no extra, linked or traversing
+  entries; the extracted package must pass the same ownership and consistency checks as before.
+- Installation is a whole-bundle transaction that restores the previous bundle if the new
+  launcher does not start. A build with a public key never accepts an unsigned record.
+
 ## Configure the channel
 
 Build the launcher with these explicit settings:

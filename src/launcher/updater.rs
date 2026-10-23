@@ -44,12 +44,20 @@ const PACKAGE_FILES: [&str; 17] = [
     "package.json",
 ];
 
+/// `key` is absent only for a build that explicitly opted into the unsigned GitHub-release
+/// channel (`KALEIDOSCOPE_UPDATE_UNSIGNED=1` without a public key). Such a channel trusts the
+/// fixed repository over HTTPS and checks the release's own asset digest; it has no publisher
+/// signature, so every signed build keeps rejecting unsigned records.
 #[derive(Clone)]
 struct Trust {
     repository: String,
-    key: [u8; 32],
+    key: Option<[u8; 32]>,
     version: Version,
 }
+
+const UNSIGNED_ZERO_SHA256: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+const UNSIGNED_ZERO_COMMIT: &str = "0000000000000000000000000000000000000000";
 
 fn valid_repository(repository: &str) -> bool {
     let Some((owner, name)) = repository.split_once('/') else {
@@ -95,16 +103,46 @@ fn stable_version(value: &str) -> Result<Version> {
     Ok(version)
 }
 
+/// True only when the build opted into the unsigned channel and carries no signing key.
+fn unsigned_channel() -> bool {
+    option_env!("KALEIDOSCOPE_UPDATE_UNSIGNED") == Some("1")
+        && option_env!("KALEIDOSCOPE_UPDATE_PUBLIC_KEY").is_none()
+}
+
+/// `Sha256` digest GitHub publishes for a release asset, as 64 lowercase hex characters.
+fn asset_digest(asset: &Asset) -> Result<String> {
+    let digest = asset
+        .digest
+        .as_deref()
+        .and_then(|value| value.strip_prefix("sha256:"))
+        .ok_or("GitHub 發行檔缺少 SHA-256 摘要；未安裝任何檔案")?;
+    hex_bytes::<32>(digest)?;
+    Ok(digest.to_owned())
+}
+
+fn unsigned_envelope(manifest: &impl Serialize) -> Result<Envelope> {
+    Ok(Envelope {
+        manifest: STANDARD.encode(serde_json::to_vec(manifest).map_err(|_| "無法序列化更新資訊")?),
+        signature: String::new(),
+    })
+}
+
 fn compiled_trust() -> Result<Trust> {
     let repository = option_env!("KALEIDOSCOPE_UPDATE_REPOSITORY")
         .filter(|value| valid_repository(value))
+        .or(unsigned_channel().then_some("Illyavrs/Kaleidoscope"))
         .ok_or("此版本尚未設定 GitHub 更新來源")?;
-    let key = hex_bytes(
-        option_env!("KALEIDOSCOPE_UPDATE_PUBLIC_KEY").ok_or("此版本尚未設定更新簽章公鑰")?,
-    )?;
-    if key == [0; 32] {
-        return Err("更新簽章公鑰無效".into());
-    }
+    let key = if unsigned_channel() {
+        None
+    } else {
+        let key = hex_bytes(
+            option_env!("KALEIDOSCOPE_UPDATE_PUBLIC_KEY").ok_or("此版本尚未設定更新簽章公鑰")?,
+        )?;
+        if key == [0; 32] {
+            return Err("更新簽章公鑰無效".into());
+        }
+        Some(key)
+    };
     Ok(Trust {
         repository: repository.to_owned(),
         key,
@@ -147,7 +185,12 @@ pub fn build_configuration() -> Result<BuildConfiguration> {
         protocol: 1,
         configured: true,
         repository: trust.repository,
-        public_key: trust.key.iter().map(|byte| format!("{byte:02x}")).collect(),
+        public_key: trust
+            .key
+            .ok_or("未簽章更新通道沒有簽章公鑰")?
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
         version: trust.version.to_string(),
         bridge_version: bundled_bridge_version()?.to_string(),
     })
@@ -178,7 +221,11 @@ pub fn status() -> UpdateStatus {
             current_version: trust.version.to_string(),
             available_version: None,
             download_bytes: None,
-            detail: "啟動器更新會附帶配套連線模組。".into(),
+            detail: if trust.key.is_none() {
+                "直接取得 GitHub 最新發行版（無發行者簽章，僅以來源倉庫與檔案摘要核對）。".into()
+            } else {
+                "啟動器更新會附帶配套連線模組。".into()
+            },
             bridge_configured: false,
             bridge_repository: None,
             bridge_version: None,
@@ -252,24 +299,38 @@ fn verify_manifest(bytes: &[u8], trust: &Trust) -> Result<(Envelope, Manifest)> 
     let payload = STANDARD
         .decode(&envelope.manifest)
         .map_err(|_| "更新簽章格式不正確")?;
-    let signature = STANDARD
-        .decode(&envelope.signature)
-        .map_err(|_| "更新簽章格式不正確")?;
-    if payload.len() as u64 > MAX_JSON || signature.len() != 64 {
+    if payload.len() as u64 > MAX_JSON {
         return Err("更新簽章格式不正確".into());
     }
-    UnparsedPublicKey::new(&ED25519, trust.key)
-        .verify(&payload, &signature)
-        .map_err(|_| "更新簽章驗證失敗；未安裝任何檔案")?;
+    match trust.key {
+        Some(key) => {
+            let signature = STANDARD
+                .decode(&envelope.signature)
+                .map_err(|_| "更新簽章格式不正確")?;
+            if signature.len() != 64 {
+                return Err("更新簽章格式不正確".into());
+            }
+            UnparsedPublicKey::new(&ED25519, key)
+                .verify(&payload, &signature)
+                .map_err(|_| "更新簽章驗證失敗；未安裝任何檔案")?;
+        }
+        None if envelope.signature.is_empty() => {}
+        None => return Err("未簽章更新通道不接受簽章資料".into()),
+    }
     let manifest: Manifest = serde_json::from_slice(&payload).map_err(|_| "更新資訊格式不正確")?;
     let version = stable_version(&manifest.version)?;
     stable_version(&manifest.bridge_version)?;
+    let expected_asset = if trust.key.is_some() {
+        format!("Kaleidoscope-{version}-windows-x64.zip")
+    } else {
+        format!("Kaleidoscope-{version}-windows-x64-portable.zip")
+    };
     if manifest.protocol != 1
         || manifest.platform != "windows-x64"
         || manifest.repository != trust.repository
         || version <= trust.version
         || manifest.tag != format!("v{version}")
-        || manifest.asset != format!("Kaleidoscope-{version}-windows-x64.zip")
+        || manifest.asset != expected_asset
         || manifest.bytes == 0
         || manifest.bytes > MAX_PACKAGE
         || manifest
@@ -310,6 +371,8 @@ struct Asset {
     name: String,
     browser_download_url: String,
     size: u64,
+    #[serde(default)]
+    digest: Option<String>,
 }
 
 fn client() -> Result<Client> {
@@ -488,6 +551,23 @@ impl Manager {
         if version <= stable_version(&installed)? {
             return Ok(None);
         }
+        if !configuration.signed {
+            let name = format!("Transfiguration-{version}-windows-x64.zip");
+            let package = release_asset(&release, &configuration.repository, &name)?;
+            if package.size == 0 || package.size > MAX_PACKAGE {
+                return Err("Transfiguration 更新套件大小不正確".into());
+            }
+            return bridge_feed::unsigned_release(
+                &configuration.repository,
+                &version.to_string(),
+                &release.tag_name,
+                &name,
+                package.size,
+                &asset_digest(package)?,
+                launcher_version(),
+            )
+            .map(Some);
+        }
         let signed = release_asset(&release, &configuration.repository, MANIFEST_ASSET)?;
         if signed.size == 0 || signed.size > MAX_JSON {
             return Err("Transfiguration 更新簽章大小不正確".into());
@@ -538,28 +618,64 @@ impl Manager {
                 ..status()
             });
         }
-        let signed = release_asset(&release, &trust.repository, MANIFEST_ASSET)?;
-        if signed.size == 0 || signed.size > MAX_JSON {
-            return Err("GitHub 更新簽章大小不正確".into());
-        }
-        let bytes = fetch(
-            &client,
-            Url::parse(&signed.browser_download_url).map_err(|_| "GitHub 更新來源無效")?,
-            MAX_JSON,
-            false,
-        )?;
-        let (envelope, manifest) = verify_manifest(&bytes, &trust)?;
-        let executable =
-            canonical_file(&std::env::current_exe().map_err(|_| "無法確認啟動器位置")?)?;
-        let installed_bridge = bridge_feed::installed_version(
-            executable.parent().ok_or("啟動器缺少資料夾")?,
-            launcher_version(),
-        )?;
-        ensure_no_bridge_downgrade(&manifest.bridge_version, &installed_bridge)?;
-        let package = release_asset(&release, &trust.repository, &manifest.asset)?;
-        if manifest.tag != release.tag_name || package.size != manifest.bytes {
-            return Err("GitHub 發行版本與已簽章套件不一致".into());
-        }
+        let (envelope, manifest) = if trust.key.is_none() {
+            // No updates.json: describe the release from its own asset, then verify the
+            // download against GitHub's digest. The file inventory is filled in at install.
+            let name = format!("Kaleidoscope-{version}-windows-x64-portable.zip");
+            let package = release_asset(&release, &trust.repository, &name)?;
+            if package.size == 0 || package.size > MAX_PACKAGE {
+                return Err("GitHub 更新套件大小不正確".into());
+            }
+            let manifest = Manifest {
+                protocol: 1,
+                version: version.to_string(),
+                platform: "windows-x64".into(),
+                repository: trust.repository.clone(),
+                tag: release.tag_name.clone(),
+                asset: name,
+                bytes: package.size,
+                sha256: asset_digest(package)?,
+                launcher_sha256: UNSIGNED_ZERO_SHA256.into(),
+                bridge_sha256: UNSIGNED_ZERO_SHA256.into(),
+                kaleidoscope_commit: UNSIGNED_ZERO_COMMIT.into(),
+                transfiguration_commit: UNSIGNED_ZERO_COMMIT.into(),
+                bridge_version: "0.0.0".into(),
+                files: PACKAGE_FILES
+                    .into_iter()
+                    .map(|name| (name.to_owned(), UNSIGNED_ZERO_SHA256.to_owned()))
+                    .collect(),
+            };
+            let envelope = unsigned_envelope(&manifest)?;
+            verify_manifest(
+                &serde_json::to_vec(&envelope).map_err(|_| "無法讀取更新資訊")?,
+                &trust,
+            )?;
+            (envelope, manifest)
+        } else {
+            let signed = release_asset(&release, &trust.repository, MANIFEST_ASSET)?;
+            if signed.size == 0 || signed.size > MAX_JSON {
+                return Err("GitHub 更新簽章大小不正確".into());
+            }
+            let bytes = fetch(
+                &client,
+                Url::parse(&signed.browser_download_url).map_err(|_| "GitHub 更新來源無效")?,
+                MAX_JSON,
+                false,
+            )?;
+            let (envelope, manifest) = verify_manifest(&bytes, &trust)?;
+            let executable =
+                canonical_file(&std::env::current_exe().map_err(|_| "無法確認啟動器位置")?)?;
+            let installed_bridge = bridge_feed::installed_version(
+                executable.parent().ok_or("啟動器缺少資料夾")?,
+                launcher_version(),
+            )?;
+            ensure_no_bridge_downgrade(&manifest.bridge_version, &installed_bridge)?;
+            let package = release_asset(&release, &trust.repository, &manifest.asset)?;
+            if manifest.tag != release.tag_name || package.size != manifest.bytes {
+                return Err("GitHub 發行版本與已簽章套件不一致".into());
+            }
+            (envelope, manifest)
+        };
         let state = UpdateStatus {
             available_version: Some(manifest.version.clone()),
             download_bytes: Some(manifest.bytes),
@@ -589,10 +705,12 @@ impl Manager {
         }
         let target = executable.parent().ok_or("啟動器套件路徑無效")?;
         let old_files = verify_owned_package(target)?;
-        ensure_no_bridge_downgrade(
-            &candidate.manifest.bridge_version,
-            &bridge_feed::installed_version(target, launcher_version())?,
-        )?;
+        if trust.key.is_some() {
+            ensure_no_bridge_downgrade(
+                &candidate.manifest.bridge_version,
+                &bridge_feed::installed_version(target, launcher_version())?,
+            )?;
+        }
         let parent = target.parent().ok_or("啟動器套件必須有父資料夾")?;
         check_path(parent)?;
         let workspace = parent.join(format!(".kaleidoscope-update-{}", Uuid::new_v4()));
@@ -615,13 +733,30 @@ impl Manager {
             if bytes.len() as u64 != candidate.manifest.bytes
                 || hash_bytes(&bytes) != candidate.manifest.sha256
             {
-                return Err("更新套件雜湊不符合簽章；未安裝任何檔案".into());
+                return Err("更新套件雜湊不符合發行資訊；未安裝任何檔案".into());
             }
-            extract_package(&bytes, &payload, &candidate.manifest)?;
+            let (manifest, envelope) = if trust.key.is_none() {
+                let files = extract_files(&bytes, &payload, None, &PACKAGE_FILES)?;
+                let manifest = Manifest {
+                    launcher_sha256: files["Kaleidoscope.exe"].clone(),
+                    bridge_sha256: files[BRIDGE].clone(),
+                    files,
+                    ..candidate.manifest.clone()
+                };
+                let envelope = unsigned_envelope(&manifest)?;
+                verify_manifest(
+                    &serde_json::to_vec(&envelope).map_err(|_| "無法讀取更新資訊")?,
+                    &trust,
+                )?;
+                (manifest, envelope)
+            } else {
+                extract_package(&bytes, &payload, &candidate.manifest)?;
+                (candidate.manifest.clone(), candidate.envelope.clone())
+            };
             verify_owned_package(&payload)?;
             let helper = workspace.join("update-helper.exe");
             fs::copy(payload.join("Kaleidoscope.exe"), &helper).map_err(|_| "無法準備更新程序")?;
-            if hash_file(&helper)? != candidate.manifest.launcher_sha256 {
+            if hash_file(&helper)? != manifest.launcher_sha256 {
                 return Err("更新程序驗證失敗".into());
             }
             let transaction = Transaction {
@@ -630,7 +765,7 @@ impl Manager {
                 target: target.to_path_buf(),
                 target_identity: install::directory_identity(target)?,
                 old_files,
-                envelope: candidate.envelope.clone(),
+                envelope,
                 previous_version: trust.version.to_string(),
                 component: UpdateComponent::Launcher,
             };
@@ -726,9 +861,22 @@ impl Manager {
             if bytes.len() as u64 != candidate.manifest.bytes
                 || hash_bytes(&bytes) != candidate.manifest.sha256
             {
-                return Err("連線模組更新套件雜湊不符合簽章；未安裝任何檔案".into());
+                return Err("連線模組更新套件雜湊不符合發行資訊；未安裝任何檔案".into());
             }
-            extract_files(&bytes, &payload, &candidate.manifest.files)?;
+            let release = if bridge_feed::configuration()?.signed {
+                extract_files(
+                    &bytes,
+                    &payload,
+                    Some(&candidate.manifest.files),
+                    &bridge_feed::COMPONENT_FILES,
+                )?;
+                candidate.clone()
+            } else {
+                let files =
+                    extract_files(&bytes, &payload, None, &bridge_feed::COMPONENT_FILES)?;
+                bridge_feed::unsigned_release_with_files(&candidate.manifest, files)?
+            };
+            let candidate = &release;
             bridge_feed::validate_component(&payload, &candidate.manifest)?;
             let package = updated_bridge_package(target, &candidate.manifest)?;
             let mut package_file = OpenOptions::new()
@@ -994,22 +1142,31 @@ fn verify_owned_package(root: &Path) -> Result<BTreeMap<String, String>> {
 }
 
 fn extract_package(bytes: &[u8], root: &Path, manifest: &Manifest) -> Result<()> {
-    extract_files(bytes, root, &manifest.files)
+    extract_files(bytes, root, Some(&manifest.files), &PACKAGE_FILES).map(|_| ())
 }
 
-fn extract_files(bytes: &[u8], root: &Path, files: &BTreeMap<String, String>) -> Result<()> {
+/// Writes exactly `names` from the archive and returns the hash of every extracted file. With
+/// `files` each hash must equal the signed value; without it (unsigned channel) the archive must
+/// still contain exactly the allowed names and nothing else.
+fn extract_files(
+    bytes: &[u8],
+    root: &Path,
+    files: Option<&BTreeMap<String, String>>,
+    names: &[&str],
+) -> Result<BTreeMap<String, String>> {
     let mut archive =
         zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|_| "更新 ZIP 無效")?;
-    if archive.len() != files.len() {
+    if archive.len() != files.map_or(names.len(), BTreeMap::len) {
         return Err("更新 ZIP 內容數量不正確".into());
     }
     let mut seen = BTreeSet::new();
+    let mut computed = BTreeMap::new();
     let mut total = 0_u64;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).map_err(|_| "無法讀取更新 ZIP")?;
         let name = entry.name().to_owned();
-        if !files.contains_key(&name)
-            || !PACKAGE_FILES.contains(&name.as_str())
+        if files.is_some_and(|files| !files.contains_key(&name))
+            || !names.contains(&name.as_str())
             || !seen.insert(name.clone())
             || entry.is_dir()
             || entry.size() == 0
@@ -1045,11 +1202,16 @@ fn extract_files(bytes: &[u8], root: &Path, files: &BTreeMap<String, String>) ->
             return Err("更新 ZIP 檔案大小不正確".into());
         }
         file.sync_all().map_err(|_| "無法保存更新檔案")?;
-        if files.get(&name) != Some(&hash_file(&path)?) {
+        let hash = hash_file(&path)?;
+        if files.is_some_and(|files| files.get(&name) != Some(&hash)) {
             return Err("更新檔案雜湊不符合簽章".into());
         }
+        computed.insert(name, hash);
     }
-    Ok(())
+    if computed.len() != names.len() {
+        return Err("更新 ZIP 缺少必要檔案".into());
+    }
+    Ok(computed)
 }
 
 pub fn handle_internal(arguments: &[String]) -> Option<Result<i32>> {
@@ -1196,11 +1358,18 @@ fn verify_transaction_payload(
             {
                 return Err("更新程序與已簽章版本不一致".into());
             }
-            if stable_version(&manifest.bridge_version)? != bundled_bridge_version()? {
-                return Err("新版啟動器附帶的連線模組版本與簽章不一致".into());
-            }
+            // The unsigned channel records no bridge version; this helper is the new launcher,
+            // so its own compiled bundled version is what the installation would carry.
+            let bundled = if trust.key.is_none() {
+                bundled_bridge_version()?.to_string()
+            } else {
+                if stable_version(&manifest.bridge_version)? != bundled_bridge_version()? {
+                    return Err("新版啟動器附帶的連線模組版本與簽章不一致".into());
+                }
+                manifest.bridge_version.clone()
+            };
             ensure_no_bridge_downgrade(
-                &manifest.bridge_version,
+                &bundled,
                 &bridge_feed::installed_version(
                     &transaction.target,
                     &transaction.previous_version,

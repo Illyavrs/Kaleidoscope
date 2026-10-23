@@ -2,7 +2,8 @@
 //! missing trust, invalid signatures, or changed component files fail closed.
 
 use super::{
-    hash_bytes, hash_file, hex_bytes, read_bounded, stable_version, valid_repository, Envelope,
+    hash_bytes, hash_file, hex_bytes, read_bounded, stable_version, unsigned_channel,
+    unsigned_envelope, valid_repository, Envelope, UNSIGNED_ZERO_COMMIT, UNSIGNED_ZERO_SHA256,
 };
 use crate::Result;
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -55,7 +56,7 @@ const REQUIRED_CONTRACTS: [&str; 12] = [
 #[derive(Clone)]
 struct Trust {
     repository: String,
-    key: [u8; 32],
+    key: Option<[u8; 32]>,
     bundled_version: Version,
 }
 
@@ -64,6 +65,7 @@ pub(super) struct BridgeConfiguration {
     pub repository: String,
     pub public_key: String,
     pub bundled_version: String,
+    pub signed: bool,
 }
 
 fn bundled_version() -> Result<Version> {
@@ -71,16 +73,23 @@ fn bundled_version() -> Result<Version> {
 }
 
 fn compiled_trust() -> Result<Trust> {
+    let unsigned = unsigned_channel() && option_env!("TRANSFIGURATION_UPDATE_PUBLIC_KEY").is_none();
     let repository = option_env!("TRANSFIGURATION_UPDATE_REPOSITORY")
         .filter(|value| valid_repository(value))
+        .or(unsigned.then_some("Illyavrs/Transfiguration"))
         .ok_or("此版本尚未設定 Transfiguration 的 GitHub 更新來源")?;
-    let key = hex_bytes(
-        option_env!("TRANSFIGURATION_UPDATE_PUBLIC_KEY")
-            .ok_or("此版本尚未設定 Transfiguration 更新簽章公鑰")?,
-    )?;
-    if key == [0; 32] {
-        return Err("Transfiguration 更新簽章公鑰無效".into());
-    }
+    let key = if unsigned {
+        None
+    } else {
+        let key = hex_bytes(
+            option_env!("TRANSFIGURATION_UPDATE_PUBLIC_KEY")
+                .ok_or("此版本尚未設定 Transfiguration 更新簽章公鑰")?,
+        )?;
+        if key == [0; 32] {
+            return Err("Transfiguration 更新簽章公鑰無效".into());
+        }
+        Some(key)
+    };
     Ok(Trust {
         repository: repository.to_owned(),
         key,
@@ -92,8 +101,14 @@ pub(super) fn configuration() -> Result<BridgeConfiguration> {
     let trust = compiled_trust()?;
     Ok(BridgeConfiguration {
         repository: trust.repository,
-        public_key: trust.key.iter().map(|byte| format!("{byte:02x}")).collect(),
+        public_key: trust
+            .key
+            .iter()
+            .flatten()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
         bundled_version: trust.bundled_version.to_string(),
+        signed: trust.key.is_some(),
     })
 }
 
@@ -133,15 +148,24 @@ fn parse_with_trust(bytes: &[u8], launcher_version: &str, trust: &Trust) -> Resu
     let payload = STANDARD
         .decode(&envelope.manifest)
         .map_err(|_| "Transfiguration 更新簽章格式不正確")?;
-    let signature = STANDARD
-        .decode(&envelope.signature)
-        .map_err(|_| "Transfiguration 更新簽章格式不正確")?;
-    if payload.len() as u64 > MAX_JSON || signature.len() != 64 {
+    if payload.len() as u64 > MAX_JSON {
         return Err("Transfiguration 更新簽章格式不正確".into());
     }
-    UnparsedPublicKey::new(&ED25519, trust.key)
-        .verify(&payload, &signature)
-        .map_err(|_| "Transfiguration 更新簽章驗證失敗；未安裝任何檔案")?;
+    match trust.key {
+        Some(key) => {
+            let signature = STANDARD
+                .decode(&envelope.signature)
+                .map_err(|_| "Transfiguration 更新簽章格式不正確")?;
+            if signature.len() != 64 {
+                return Err("Transfiguration 更新簽章格式不正確".into());
+            }
+            UnparsedPublicKey::new(&ED25519, key)
+                .verify(&payload, &signature)
+                .map_err(|_| "Transfiguration 更新簽章驗證失敗；未安裝任何檔案")?;
+        }
+        None if envelope.signature.is_empty() => {}
+        None => return Err("未簽章更新通道不接受簽章資料".into()),
+    }
     let manifest: BridgeManifest =
         serde_json::from_slice(&payload).map_err(|_| "Transfiguration 更新資訊格式不正確")?;
     let version = stable_version(&manifest.version)?;
@@ -188,6 +212,62 @@ fn parse_with_trust(bytes: &[u8], launcher_version: &str, trust: &Trust) -> Resu
     Ok(BridgeRelease { envelope, manifest })
 }
 
+/// A release described only by GitHub's own record of its asset. Hashes of the extracted files
+/// are filled in once the archive has been downloaded and checked against `sha256`.
+pub(super) fn unsigned_release(
+    repository: &str,
+    version: &str,
+    tag: &str,
+    asset: &str,
+    bytes: u64,
+    sha256: &str,
+    launcher_version: &str,
+) -> Result<BridgeRelease> {
+    let manifest = BridgeManifest {
+        protocol: 1,
+        version: version.to_owned(),
+        platform: "windows-x64".into(),
+        repository: repository.to_owned(),
+        tag: tag.to_owned(),
+        asset: asset.to_owned(),
+        bytes,
+        sha256: sha256.to_owned(),
+        bridge_sha256: UNSIGNED_ZERO_SHA256.into(),
+        transfiguration_commit: UNSIGNED_ZERO_COMMIT.into(),
+        launcher_requirement: "*".into(),
+        files: COMPONENT_FILES
+            .into_iter()
+            .map(|name| (name.to_owned(), UNSIGNED_ZERO_SHA256.to_owned()))
+            .collect(),
+    };
+    release_from_manifest(manifest, launcher_version)
+}
+
+/// The same release after extraction, carrying the real file hashes.
+pub(super) fn unsigned_release_with_files(
+    pending: &BridgeManifest,
+    files: BTreeMap<String, String>,
+) -> Result<BridgeRelease> {
+    let manifest = BridgeManifest {
+        bridge_sha256: files
+            .get(BRIDGE)
+            .cloned()
+            .ok_or("Transfiguration 元件缺少連線模組")?,
+        files,
+        ..pending.clone()
+    };
+    release_from_manifest(
+        manifest,
+        option_env!("KALEIDOSCOPE_UPDATE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
+    )
+}
+
+fn release_from_manifest(manifest: BridgeManifest, launcher_version: &str) -> Result<BridgeRelease> {
+    let bytes = serde_json::to_vec(&unsigned_envelope(&manifest)?)
+        .map_err(|_| "無法序列化 Transfiguration 更新資訊")?;
+    parse_signed_manifest(&bytes, launcher_version)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Artifact {
@@ -221,13 +301,31 @@ struct CompatibilityMetadata {
     shared_game_preferences: bool,
     fixture: bool,
     platform: String,
-    native_client_version: String,
+    #[serde(default)]
+    native_client_version: Option<String>,
     runtime: String,
     ruleset_api: String,
     harmony: String,
     assemblies: BTreeMap<String, NativeAssembly>,
     contracts: Vec<String>,
     verification: BTreeMap<String, String>,
+}
+
+/// The default private-server origin shipped in a component: an HTTPS DNS name with no path,
+/// credentials, query or non-default port. It is only a default; each session fixes its own.
+fn valid_endpoint_origin(value: &str) -> bool {
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.path() == "/"
+        && !value.ends_with("//")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.port().is_none()
+        && matches!(url.host(), Some(url::Host::Domain(domain)) if domain.contains('.') && domain != "localhost")
 }
 
 fn four_part_version(value: &str) -> bool {
@@ -258,7 +356,7 @@ fn component_compatibility(
         || compatibility.artifact != BRIDGE
         || compatibility.fixture
         || compatibility.platform != "windows-x64"
-        || compatibility.default_endpoint != "https://illya.test"
+        || !valid_endpoint_origin(&compatibility.default_endpoint)
         || compatibility.endpoint_mode != "https_origin_per_session"
         || !compatibility.configurable_endpoint
         || compatibility.private_auth_filename != "auth.illyaverse.json"
@@ -266,8 +364,19 @@ fn component_compatibility(
     {
         return Err("Transfiguration 相容性紀錄與私服連線策略不一致".into());
     }
+    // Releases that predate the signed-component format do not record the lazer version; it is
+    // then read from the exact osu.Game.dll version they already pin.
+    let native_client_version = match &compatibility.native_client_version {
+        Some(version) => version.clone(),
+        None => compatibility
+            .assemblies
+            .get("osu.Game.dll")
+            .and_then(|assembly| assembly.version.strip_suffix(".0"))
+            .ok_or("Transfiguration 原生組件版本格式不正確")?
+            .to_owned(),
+    };
     for version in [
-        &compatibility.native_client_version,
+        &native_client_version,
         &compatibility.runtime,
         &compatibility.ruleset_api,
         &compatibility.harmony,
@@ -289,7 +398,7 @@ fn component_compatibility(
         }
         hex_bytes::<32>(&assembly.sha256.to_ascii_lowercase())?;
     }
-    let client_assembly_version = format!("{}.0", compatibility.native_client_version);
+    let client_assembly_version = format!("{native_client_version}.0");
     if compatibility.assemblies["osu.Game.dll"].version != client_assembly_version
         || compatibility.assemblies["osu!.dll"].version != client_assembly_version
     {
@@ -369,7 +478,7 @@ pub(super) fn validate_component(root: &Path, manifest: &BridgeManifest) -> Resu
         || artifact.artifact != BRIDGE
         || artifact.sha256 != manifest.bridge_sha256
         || artifact.fixture
-        || artifact.default_endpoint != "https://illya.test"
+        || !valid_endpoint_origin(&artifact.default_endpoint)
         || artifact.endpoint_mode != "https_origin_per_session"
         || !artifact.configurable_endpoint
         || artifact.private_auth_filename != "auth.illyaverse.json"
@@ -428,7 +537,7 @@ mod tests {
         let pair = Ed25519KeyPair::from_seed_unchecked(&[19; 32]).unwrap();
         let trust = Trust {
             repository: "example/Transfiguration".into(),
-            key: pair.public_key().as_ref().try_into().unwrap(),
+            key: Some(pair.public_key().as_ref().try_into().unwrap()),
             bundled_version: Version::parse("0.1.0").unwrap(),
         };
         (pair, trust)
@@ -705,6 +814,67 @@ mod tests {
             assert!(validate_component(&root, &release.manifest).is_err());
             assert!(native_assemblies(&root, &release.manifest).is_err());
         }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn unsigned_release_flows_from_github_record_to_extracted_hashes() {
+        // The compiled channel is fixed per build, so the shared parser is exercised with an
+        // explicit unsigned trust.
+        let trust = Trust {
+            repository: "example/Transfiguration".into(),
+            key: None,
+            bundled_version: Version::parse("0.1.0").unwrap(),
+        };
+        let mut manifest = manifest();
+        manifest.version = "0.1.3".into();
+        manifest.tag = "v0.1.3".into();
+        manifest.asset = "Transfiguration-0.1.3-windows-x64.zip".into();
+        manifest.launcher_requirement = "*".into();
+        let bytes = serde_json::to_vec(&unsigned_envelope(&manifest).unwrap()).unwrap();
+        let release = parse_with_trust(&bytes, "0.1.0", &trust).unwrap();
+        assert_eq!(release.manifest.version, "0.1.3");
+        let mut signed_trust = trust.clone();
+        signed_trust.key = Some([7; 32]);
+        assert!(parse_with_trust(&bytes, "0.1.0", &signed_trust).is_err());
+        let mut envelope = unsigned_envelope(&manifest).unwrap();
+        envelope.signature = STANDARD.encode([0u8; 64]);
+        assert!(parse_with_trust(&serde_json::to_vec(&envelope).unwrap(), "0.1.0", &trust).is_err());
+    }
+
+    #[test]
+    fn released_component_shape_is_accepted_and_foreign_default_origins_are_not() {
+        let root =
+            std::env::temp_dir().join(format!("kaleidoscope-bridge-feed-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let mut manifest = component(&root);
+        // Published components default to the operator's own origin and predate
+        // native_client_version; the lazer version comes from the pinned osu.Game.dll.
+        for name in ["artifact.json", "compatibility.json"] {
+            let path = root.join(name);
+            let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            value["default_endpoint"] = "https://shdcloud.top".into();
+            if name == "compatibility.json" {
+                value.as_object_mut().unwrap().remove("native_client_version");
+            }
+            fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            manifest.files.insert(name.into(), hash_file(&path).unwrap());
+        }
+        validate_component(&root, &manifest).unwrap();
+        for bad in [
+            "http://shdcloud.top",
+            "https://shdcloud.top/path",
+            "https://user@shdcloud.top",
+            "https://shdcloud.top:8443",
+            "https://localhost",
+            "https://127.0.0.1",
+            "https://shdcloud.top/?q=1",
+            "shdcloud.top",
+        ] {
+            assert!(!valid_endpoint_origin(bad), "{bad}");
+        }
+        assert!(valid_endpoint_origin("https://shdcloud.top"));
+        assert!(valid_endpoint_origin("https://illya.test"));
         fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -7,7 +7,7 @@ fn fixture() -> (Trust, Ed25519KeyPair, Manifest) {
     let pair = Ed25519KeyPair::from_seed_unchecked(&[71; 32]).unwrap();
     let trust = Trust {
         repository: "example/Kaleidoscope".into(),
-        key: pair.public_key().as_ref().try_into().unwrap(),
+        key: Some(pair.public_key().as_ref().try_into().unwrap()),
         version: Version::new(1, 0, 0),
     };
     let files = PACKAGE_FILES
@@ -56,7 +56,7 @@ fn signed_manifest_binds_exact_bundle_source_versions_and_components() {
     tampered.manifest = STANDARD.encode(payload);
     assert!(verify_manifest(&serde_json::to_vec(&tampered).unwrap(), &trust).is_err());
     let mut foreign = trust.clone();
-    foreign.key = [9; 32];
+    foreign.key = Some([9; 32]);
     assert!(verify_manifest(&signed(&pair, &manifest), &foreign).is_err());
 }
 
@@ -110,6 +110,7 @@ fn github_asset_links_and_duplicates_are_rejected_before_download() {
         name: MANIFEST_ASSET.into(),
         browser_download_url: url.into(),
         size: 20,
+        digest: None,
     };
     let mut release = Release {
         tag_name: "v1.1.0".into(),
@@ -404,4 +405,95 @@ fn launcher_updates_never_roll_back_an_independently_updated_bridge() {
     assert!(ensure_no_bridge_downgrade("0.1.5", "0.1.5").is_ok());
     assert!(ensure_no_bridge_downgrade("0.2.0", "0.1.5").is_ok());
     assert!(ensure_no_bridge_downgrade("0.2.0-beta.1", "0.1.5").is_err());
+}
+
+fn unsigned_fixture() -> (Trust, Manifest) {
+    let (mut trust, _, mut manifest) = fixture();
+    trust.key = None;
+    manifest.asset = "Kaleidoscope-1.1.0-windows-x64-portable.zip".into();
+    (trust, manifest)
+}
+
+fn unsigned_bytes(manifest: &Manifest) -> Vec<u8> {
+    serde_json::to_vec(&unsigned_envelope(manifest).unwrap()).unwrap()
+}
+
+#[test]
+fn unsigned_channel_accepts_only_unsigned_records_for_the_portable_asset() {
+    let (trust, manifest) = unsigned_fixture();
+    verify_manifest(&unsigned_bytes(&manifest), &trust).unwrap();
+    // A signed build never accepts a record without a valid signature.
+    let mut signed_trust = trust.clone();
+    signed_trust.key = Some([7; 32]);
+    assert!(verify_manifest(&unsigned_bytes(&manifest), &signed_trust).is_err());
+    // An unsigned build never accepts signature material it cannot verify.
+    let mut envelope = unsigned_envelope(&manifest).unwrap();
+    envelope.signature = STANDARD.encode([0u8; 64]);
+    assert!(verify_manifest(&serde_json::to_vec(&envelope).unwrap(), &trust).is_err());
+    let cases: [fn(&mut Manifest); 7] = [
+        |value| value.version = "1.0.0".into(),
+        |value| value.version = "1.1.0-beta.1".into(),
+        |value| value.repository = "other/Kaleidoscope".into(),
+        |value| value.tag = "v9.0.0".into(),
+        |value| value.asset = "Kaleidoscope-1.1.0-windows-x64.zip".into(),
+        |value| value.bytes = MAX_PACKAGE + 1,
+        |value| {
+            value.files.insert("../user.txt".into(), "0".repeat(64));
+        },
+    ];
+    for change in cases {
+        let mut value = manifest.clone();
+        change(&mut value);
+        assert!(verify_manifest(&unsigned_bytes(&value), &trust).is_err());
+    }
+}
+
+#[test]
+fn github_asset_digest_must_be_a_lowercase_sha256() {
+    let asset = |digest: Option<&str>| Asset {
+        name: "a.zip".into(),
+        browser_download_url: String::new(),
+        size: 1,
+        digest: digest.map(str::to_owned),
+    };
+    let hash = "a".repeat(64);
+    assert_eq!(
+        asset_digest(&asset(Some(&format!("sha256:{hash}")))).unwrap(),
+        hash
+    );
+    for bad in [
+        None,
+        Some("sha256:abc"),
+        Some(&format!("sha1:{hash}")[..]),
+        Some(&format!("sha256:{}", "A".repeat(64))[..]),
+        Some(&hash[..]),
+    ] {
+        assert!(asset_digest(&asset(bad)).is_err());
+    }
+}
+
+#[test]
+fn unsigned_extraction_requires_exactly_the_allowed_files_and_reports_their_hashes() {
+    let scratch = Scratch::new();
+    let payload = scratch.0.join("payload");
+    fs::create_dir(&payload).unwrap();
+    let computed = extract_files(&archive(&PACKAGE_FILES), &payload, None, &PACKAGE_FILES).unwrap();
+    assert_eq!(computed.len(), PACKAGE_FILES.len());
+    for name in PACKAGE_FILES {
+        assert_eq!(computed[name], hash_bytes(name.as_bytes()));
+    }
+    let extra = scratch.0.join("extra");
+    fs::create_dir(&extra).unwrap();
+    let mut names = PACKAGE_FILES.to_vec();
+    names.push("extra.dll");
+    assert!(extract_files(&archive(&names), &extra, None, &PACKAGE_FILES).is_err());
+    let missing = scratch.0.join("missing");
+    fs::create_dir(&missing).unwrap();
+    assert!(extract_files(&archive(&PACKAGE_FILES[1..]), &missing, None, &PACKAGE_FILES).is_err());
+    let traversal = scratch.0.join("traversal");
+    fs::create_dir(&traversal).unwrap();
+    let mut names = PACKAGE_FILES;
+    names[0] = "../outside.txt";
+    assert!(extract_files(&archive(&names), &traversal, None, &PACKAGE_FILES).is_err());
+    assert!(!scratch.0.join("outside.txt").exists());
 }
