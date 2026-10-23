@@ -1058,6 +1058,13 @@ fn run_client(
                 "ILLYAVERSE_LAZER_SERVER_ENDPOINT",
                 session.endpoint().as_str(),
             );
+            // The bridge relaxes only the client assembly identity check, and only for this
+            // session's explicit risk acceptance; an ambient value never carries over.
+            if session.accept_risk {
+                command.env("ILLYAVERSE_LAZER_ACCEPT_RISK", "1");
+            } else {
+                command.env_remove("ILLYAVERSE_LAZER_ACCEPT_RISK");
+            }
             command.env("OSU_DISABLE_ERROR_REPORTING", "1");
             command.env("OSU_EXTERNAL_UPDATE_PROVIDER", "Illyaverse");
         }
